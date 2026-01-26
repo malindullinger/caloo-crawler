@@ -13,7 +13,7 @@ help:
 	@echo "make venv        Create venv + install deps"
 	@echo "make deps        Install/update deps (requires venv)"
 	@echo "make check       Quick sanity checks (import + simple query)"
-	@echo "make run         Run pipeline (adjust module/entry if needed)"
+	@echo "make run         Run pipeline module (override with MODULE=...)"
 	@echo "make fmt         Format code (if formatter installed)"
 	@echo "make clean       Remove caches"
 	@echo ""
@@ -34,11 +34,12 @@ check:
 	@$(PY) -c "from src.storage import supabase; print('OK supabase client created')"
 	@$(PY) -c "from src.storage import supabase; r=supabase.table('events').select('external_id').limit(1).execute(); print('OK query', len(r.data) if getattr(r,'data',None) is not None else 0)"
 
+# Default pipeline module (override: make run MODULE=src.some_other_entry)
+MODULE ?= src.pipeline
+
 run:
-	@echo "TODO: wire to your real entrypoint"
-	@echo "Try: make run ENTRY=src/pipeline.py"
-	@test -n "$(ENTRY)" || (echo "Set ENTRY=... (e.g. src/pipeline.py)"; exit 1)
-	@$(PY) $(ENTRY)
+	@$(PY) -c "import importlib; importlib.import_module('$(MODULE)'); print('OK module import:', '$(MODULE)')" >/dev/null
+	@$(PY) -m $(MODULE)
 
 fmt:
 	@echo "Optional: install ruff/black and wire formatting here"
