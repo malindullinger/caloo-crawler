@@ -37,6 +37,13 @@ SOURCES: List[SourceConfig] = [
         timezone="Europe/Zurich",
         max_items=100,
     ),
+    SourceConfig(
+        source_id="eventbrite-zurich",
+        adapter="eventbrite",
+        seed_url="https://www.eventbrite.ch/d/switzerland--zurich/events/",
+        timezone="Europe/Zurich",
+        max_items=20,  # Limited for testing
+    ),
 ]
 
 
