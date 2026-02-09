@@ -351,7 +351,69 @@ This separation explains why Courses are behaviorally first-class while remainin
 
 ---
 
-## 9. Explicitly Deferred
+## 9. Time Pill Display Rules (Canonical)
+
+### Purpose
+
+The time pill answers one question only: **"When is this happening, relative to now?"**
+
+Section headers (e.g., "This weekend" / "Coming up") provide broader context and must not be duplicated in the pill.
+
+### Canonical Rules
+
+Time pills **never** include section-level concepts such as:
+- "This weekend"
+- "Coming up"
+
+Time pills focus on **relative time + concrete date/time only**.
+
+### Language & Localization
+
+- Default language: **German**
+- Alternative language: **English**
+- One pill = one language (no mixed-language output)
+- Language handling is centralized and configurable
+- Full i18n framework is explicitly deferred
+
+### Date & Time Formatting
+
+- Weekday names are written out in full (e.g., `Dienstag`, not `Di.`)
+- Numeric dates do not include a trailing dot (correct: `27 Jan.` / incorrect: `27. Jan.`)
+- Abbreviated month names keep their dot (e.g., `Jan.`, `Feb.`)
+
+### Time Visibility Rules
+
+- Times are shown only when explicitly known (`date_precision = 'datetime'`)
+- Unknown times:
+  - Never display `00:00`
+  - Never display placeholder values
+- Seconds are never displayed
+
+### Timezone
+
+- All comparisons (Today / Tomorrow / Future) are evaluated in `Europe/Zurich`
+- System timezone or UTC must never affect pill output
+
+### Examples (German default)
+
+| Scenario | Pill Text |
+|----------|-----------|
+| Ongoing with end time | `Laufend · Bis 17:00 Uhr` |
+| Today with time | `Heute · 14:30 Uhr` |
+| Tomorrow (no time) | `Morgen` |
+| Future with time | `Samstag 14 Feb. · 11:00 Uhr` |
+| Future (no time) | `Dienstag 27 Jan.` |
+
+### Explicitly Deferred (Time Pill)
+
+- User language preference UI
+- Additional languages beyond DE/EN
+- Dynamic phrasing variations
+- Event vs Activity semantic labeling in pill
+
+---
+
+## 10. Explicitly Deferred
 
 The following are intentionally out of scope for current product, data, and architectural decisions:
 
@@ -368,7 +430,7 @@ The following are intentionally out of scope for current product, data, and arch
 
 ---
 
-## 10. Relationship to Other Documents
+## 11. Relationship to Other Documents
 
 | Document | Purpose |
 |----------|---------|
