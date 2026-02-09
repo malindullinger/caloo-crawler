@@ -25,16 +25,24 @@ _ESCAPED_DETAIL_RE = re.compile(r"\\/(?:_rte\\/anlass|anlaesseaktuelles)\\/\d+")
 
 class MaennedorfPortalAdapter(BaseAdapter):
     """
-    MVP strategy (robust to JS-rendered + escaped links):
-    - Fetch list page (seed_url), preferably with JS rendering
-    - Extract detail URLs from:
-        A) normal <a href="...">
-        B) escaped JSON strings like "\\/_rte\\/anlass\\/123"
-    - Sort by numeric id DESC (newest first) before slicing to max_items
-    - Fetch each detail page and parse:
-        - title
-        - lead container for location + datetime (robust line picking)
-        - description (optional)
+    TIER B SOURCE — MUNICIPAL EXCEPTION
+    ===================================
+    Classification: Tier B (Explicit text-based exception)
+    Decision: 2026-02-09
+    Approval: Explicitly approved for text-based datetime parsing
+
+    This source does NOT provide structured datetime (no JSON-LD, no <time>).
+    Text heuristics are QUARANTINED in this adapter only.
+    See docs/tier-b-sources.md for constraints.
+
+    Strategy:
+    - Fetch list page with JS rendering (Playwright)
+    - Extract detail URLs from href and escaped JSON strings
+    - Sort by numeric id DESC (newest first)
+    - Parse each detail page:
+        1) Try JSON-LD (never found)
+        2) Try <time> element (never found)
+        3) Fall back to text heuristic (QUARANTINED HERE)
     """
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
@@ -166,7 +174,10 @@ class MaennedorfPortalAdapter(BaseAdapter):
                 extraction_method = "time_element"
                 datetime_raw = structured.start_iso
 
-        # 3) Fallback to existing text extraction from lead container
+        # 3) Fallback to text heuristic (TIER B QUARANTINE)
+        # This text parsing is ONLY allowed for this source.
+        # Pattern: "D. Mon. YYYY, HH.MM Uhr - HH.MM Uhr"
+        # No inference, no defaults — if ambiguous, preserve unknown-time semantics.
         if not datetime_raw:
             lead_lines: List[str] = []
             if lead:

@@ -75,6 +75,21 @@ SQL DISTINCT-ON experiments may exist but are NOT authoritative until explicitly
 ## Public access
 - Incognito access to feed is expected and correct (public read contract).
 
+## Source classification (MANDATORY)
+Every event source MUST be classified before implementation. See `docs/tier-b-sources.md` for full details.
+
+| Tier | Description | Datetime Extraction |
+|------|-------------|---------------------|
+| **A** | Structured sources | JSON-LD, API, ICS, `<time>` — preferred |
+| **B** | Explicit text exceptions | Text heuristics with explicit approval |
+| **C** | Not viable | Date-only or skip entirely |
+
+**Rules:**
+- Tier A is defined by source quality, not parser cleverness
+- Never downgrade data integrity to "make a source work"
+- Tier B requires explicit approval and quarantined implementation
+- No inference, no defaults, no guessing — if uncertain, preserve unknown-time semantics
+
 ## What is explicitly deferred (do NOT implement yet)
 - Final "series" semantics (series_label, upcoming index)
 - Parent mental model: Event vs Activity vs Happening
