@@ -201,6 +201,19 @@ def sync_to_source_happenings(
 
             # status gating
             status = "pending" if start_date_local is not None else "needs_review"
+
+            # --- Time contract (migration 008) ---
+            dp = ev.get("date_precision") or "datetime"
+            start_at_out = ev.get("start_at")
+            end_at_out = ev.get("end_at")
+            if dp == "date":
+                # date-only: timestamps must be NULL
+                start_at_out = None
+                end_at_out = None
+            elif dp == "datetime" and not start_at_out:
+                # datetime precision but no start_at: needs review
+                status = "needs_review"
+
             if status == "needs_review":
                 result.needs_review += 1
 
@@ -232,9 +245,9 @@ def sync_to_source_happenings(
                 "location_raw": ev.get("location_name"),
                 "description_raw": ev.get("description"),
 
-                "date_precision": ev.get("date_precision") or "datetime",
-                "start_at": ev.get("start_at"),
-                "end_at": ev.get("end_at"),
+                "date_precision": dp,
+                "start_at": start_at_out,
+                "end_at": end_at_out,
                 "timezone": ev.get("timezone") or ZURICH_TZ,
 
                 "start_date_local": start_date_local.isoformat() if start_date_local else None,
