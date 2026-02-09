@@ -1,5 +1,25 @@
 # Crawler Time Extraction Audit
 
+## 0. Implemented Improvements
+
+### P0 — JSON-LD and `<time>` Extraction (2026-02-09)
+
+- Added `src/sources/structured_time.py` with reusable helpers for all adapters
+- JSON-LD Event `startDate`/`endDate` extraction (supports `@type` as string or array)
+- HTML `<time datetime="...">` extraction with smart candidate selection:
+  - Prefers candidates with time component over date-only
+  - Searches within event container first, then full page
+  - Picks closest future datetime when multiple candidates exist
+- ISO 8601 parsing using `datetime.fromisoformat` (timezone-safe, no dateparser)
+- Updated `_has_time_hint()` to recognize ISO datetime format
+- Uses ` | ` separator for unambiguous start/end ISO strings
+- Integrated into `MaennedorfPortalAdapter` as first consumer
+- Preserves existing text heuristics as fallback
+
+**Note:** This commit adds support; it will only affect sources that expose structured time. Maennedorf portal continues using text heuristics since it doesn't provide JSON-LD or `<time>` markup.
+
+---
+
 ## Out of Scope
 
 **This document is an audit only.** No crawler logic, SQL, or views are changed as part of this task. Implementation of improvements is deferred.

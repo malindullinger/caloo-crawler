@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import List
 from urllib.parse import urljoin
 
@@ -8,6 +9,7 @@ from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
 from ..http import http_get
+from ..structured_time import extract_jsonld_event, extract_time_element
 from ..types import SourceConfig, ExtractedItem
 
 
@@ -136,51 +138,86 @@ class MaennedorfPortalAdapter(BaseAdapter):
         if not title:
             return None
 
-        # Lead container: location lines + datetime line (NOT always last line!)
+        # Lead container for location + fallback datetime extraction
         lead = soup.select_one(".icms-lead-container")
-        lead_lines: List[str] = []
-        if lead:
-            lead_text = lead.get_text("\n", strip=True)
-            lead_lines = [ln.strip() for ln in lead_text.split("\n") if ln.strip()]
 
+        # =====================================================
+        # Structured extraction: JSON-LD and <time> elements
+        # =====================================================
         datetime_raw = None
         location_raw = None
+        extraction_method = "text_heuristic"
 
-        if lead_lines:
-            # ✅ Pick the best datetime line:
-            # 1) Prefer a line containing "Uhr" (has time window)
-            # 2) Else last line that contains a year/date-like pattern
-            dt_idx = None
+        # 1) Try JSON-LD first (most reliable when available)
+        structured = extract_jsonld_event(soup)
+        if structured and structured.start_iso:
+            extraction_method = "jsonld"
+            # Use " | " separator for unambiguous parsing in normalize.py
+            if structured.end_iso:
+                datetime_raw = f"{structured.start_iso} | {structured.end_iso}"
+            else:
+                datetime_raw = structured.start_iso
 
-            for i in range(len(lead_lines) - 1, -1, -1):
-                if "Uhr" in lead_lines[i]:
-                    dt_idx = i
-                    break
+        # 2) Try <time> element (prefer within lead container)
+        if not datetime_raw:
+            now_utc = datetime.now(timezone.utc)
+            structured = extract_time_element(soup, container=lead, reference_time=now_utc)
+            if structured and structured.start_iso:
+                extraction_method = "time_element"
+                datetime_raw = structured.start_iso
 
-            if dt_idx is None:
+        # 3) Fallback to existing text extraction from lead container
+        if not datetime_raw:
+            lead_lines: List[str] = []
+            if lead:
+                lead_text = lead.get_text("\n", strip=True)
+                lead_lines = [ln.strip() for ln in lead_text.split("\n") if ln.strip()]
+
+            if lead_lines:
+                # Pick the best datetime line:
+                # 1) Prefer a line containing "Uhr" (has time window)
+                # 2) Else last line that contains a year/date-like pattern
+                dt_idx = None
+
                 for i in range(len(lead_lines) - 1, -1, -1):
-                    if re.search(r"\d{4}", lead_lines[i]) or re.search(r"\d{1,2}\.\d{1,2}\.\d{4}", lead_lines[i]):
+                    if "Uhr" in lead_lines[i]:
                         dt_idx = i
                         break
 
-            if dt_idx is not None:
-                datetime_raw = lead_lines[dt_idx]
-                if dt_idx > 0:
-                    location_raw = ", ".join(lead_lines[:dt_idx])
+                if dt_idx is None:
+                    for i in range(len(lead_lines) - 1, -1, -1):
+                        if re.search(r"\d{4}", lead_lines[i]) or re.search(r"\d{1,2}\.\d{1,2}\.\d{4}", lead_lines[i]):
+                            dt_idx = i
+                            break
 
-            # ✅ DEBUG: print the extraction for specific pages
-            if (
-                "7060739" in detail_url
-                or "7060691" in detail_url
-                or "7060775" in detail_url
-                or "7060772" in detail_url
-            ):
-                print("\n--- DEBUG lead_lines for", detail_url)
-                print("lead_lines =", lead_lines)
-                print("picked datetime_raw =", datetime_raw)
-                print("picked location_raw =", location_raw)
-                print("---\n")
+                if dt_idx is not None:
+                    datetime_raw = lead_lines[dt_idx]
+                    if dt_idx > 0:
+                        location_raw = ", ".join(lead_lines[:dt_idx])
 
+        # Extract location from lead if not already set (for structured paths)
+        if not location_raw and lead:
+            lead_lines = [ln.strip() for ln in lead.get_text("\n", strip=True).split("\n") if ln.strip()]
+            # For structured extraction, location is typically all lines before datetime
+            # If we used structured extraction, try to find location in lead_lines
+            if lead_lines and extraction_method != "text_heuristic":
+                # Use all non-date lines as location
+                loc_lines = [ln for ln in lead_lines if not re.search(r"\d{4}", ln)]
+                if loc_lines:
+                    location_raw = ", ".join(loc_lines)
+
+        # DEBUG: print the extraction for specific pages
+        if (
+            "7060739" in detail_url
+            or "7060691" in detail_url
+            or "7060775" in detail_url
+            or "7060772" in detail_url
+        ):
+            print("\n--- DEBUG extraction for", detail_url)
+            print("extraction_method =", extraction_method)
+            print("datetime_raw =", datetime_raw)
+            print("location_raw =", location_raw)
+            print("---\n")
 
         # RawEvent requires datetime_raw to be a string
         if not datetime_raw:
@@ -199,6 +236,10 @@ class MaennedorfPortalAdapter(BaseAdapter):
             location_raw=location_raw,
             description_raw=description_raw,
             item_url=detail_url,
-            extra={"adapter": "maennedorf_portal", "detail_parsed": True},
+            extra={
+                "adapter": "maennedorf_portal",
+                "detail_parsed": True,
+                "extraction_method": extraction_method,
+            },
             fetched_at=getattr(cfg, "now_utc", None),
         )

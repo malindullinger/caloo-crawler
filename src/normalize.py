@@ -55,12 +55,18 @@ def _has_time_hint(s: str) -> bool:
     """
     Heuristic: does the raw string look like it contains time info?
     Catches:
+      - "2026-01-22T15:00:00" (ISO 8601 with time)
       - "15:00"
       - "18.00 Uhr"
       - "Uhr"
     """
     if not s:
         return False
+
+    # ISO 8601 datetime with time component (has T separator)
+    if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", s):
+        return True
+
     s_low = s.lower()
     return bool(
         re.search(r"\b\d{1,2}:\d{2}\b", s_low)
@@ -100,6 +106,40 @@ def _parse_with_dateparser(text: str) -> Optional[datetime]:
 _NUM_RANGE_RE = re.compile(
     r"^\s*(\d{2}\.\d{2}\.\d{4})\s*-\s*(\d{2}\.\d{2}\.\d{4})\s*$"
 )
+
+# ISO range with " | " separator: "2026-01-22T15:00 | 2026-01-22T17:00"
+_ISO_PIPE_RANGE_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:\d{2}|Z)?)?)"
+    r"\s*\|\s*"
+    r"(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:\d{2}|Z)?)?)"
+)
+
+# Single ISO datetime: "2026-01-22T15:00:00" or "2026-01-22"
+_ISO_SINGLE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:\d{2}|Z)?)?)$"
+)
+
+
+def _parse_iso_strict(s: str, tz: ZoneInfo) -> Optional[datetime]:
+    """Parse ISO 8601 string using fromisoformat (not dateparser).
+
+    - Handles trailing 'Z' as UTC
+    - Naive datetimes get default_tz (Europe/Zurich)
+
+    Does NOT use dateparser to avoid locale/timezone ambiguities.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt
+    except ValueError:
+        return None
 
 
 # ============================================================
@@ -159,12 +199,15 @@ def parse_datetime_or_range(
     Returns (start_local, end_local) as timezone-aware datetimes.
 
     Supports:
+      - '2026-01-22T15:00 | 2026-01-22T17:00' (ISO pipe-separated range)
+      - '2026-01-22T15:00' or '2026-01-22' (single ISO datetime or date)
       - 'DD.MM.YYYY - DD.MM.YYYY' (numeric range)
       - '22. Jan. 2026, 18.00 Uhr - 23.00 Uhr' (single DE with time)
       - '6. Jan. 2026 - 10. Feb. 2026, 14.00 Uhr - 14.45 Uhr, 45 Minuten' (range DE with optional time)
       - fallback: dateparser for simpler formats
 
     Notes:
+      - ISO formats use fromisoformat (timezone-safe, no dateparser ambiguity)
       - For date-only ranges (no time): end_local becomes 23:59 on end date (local timezone).
       - For date-only singles: dateparser usually returns 00:00; we treat it as "date precision" later.
     """
@@ -173,6 +216,21 @@ def parse_datetime_or_range(
         return None, None
 
     tz = ZoneInfo(tz_name)
+
+    # 0a) ISO pipe-separated range: "2026-01-22T15:00 | 2026-01-22T17:00"
+    m = _ISO_PIPE_RANGE_RE.match(s)
+    if m:
+        start_dt = _parse_iso_strict(m.group(1), tz)
+        end_dt = _parse_iso_strict(m.group(2), tz)
+        if start_dt:
+            return start_dt, end_dt
+
+    # 0b) Single ISO datetime: "2026-01-22T15:00" or "2026-01-22"
+    m = _ISO_SINGLE_RE.match(s)
+    if m:
+        start_dt = _parse_iso_strict(m.group(1), tz)
+        if start_dt:
+            return start_dt, None
 
     # 1) Numeric date range: "06.01.2026 - 10.02.2026"
     m = _NUM_RANGE_RE.match(s)
