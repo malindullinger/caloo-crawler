@@ -1,0 +1,7 @@
+beautifulsoup4
+requests
+python-dateutil
+dateparser
+pydantic
+supabase
+playwright
