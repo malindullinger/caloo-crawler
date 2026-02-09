@@ -75,6 +75,9 @@ SQL DISTINCT-ON experiments may exist but are NOT authoritative until explicitly
 ## Public access
 - Incognito access to feed is expected and correct (public read contract).
 
+## Domain terminology
+See `docs/glossary.md` for canonical definitions of: Happening, Course, Occurrence, Offering, Organizer, Source Record.
+
 ## Source classification (MANDATORY)
 Every event source MUST be classified before implementation. See `docs/tier-b-sources.md` for full details.
 
