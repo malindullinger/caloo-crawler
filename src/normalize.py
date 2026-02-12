@@ -56,6 +56,7 @@ def _has_time_hint(s: str) -> bool:
     Heuristic: does the raw string look like it contains time info?
     Catches:
       - "2026-01-22T15:00:00" (ISO 8601 with time)
+      - "2026-01-22 15:00:00" (ISO-ish with space)
       - "15:00"
       - "18.00 Uhr"
       - "Uhr"
@@ -63,11 +64,13 @@ def _has_time_hint(s: str) -> bool:
     if not s:
         return False
 
-    # ISO 8601 datetime with time component (has T separator)
-    if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", s):
+    s = s.strip()
+    s_low = s.lower()
+
+    # ISO 8601 with T or space
+    if re.search(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", s):
         return True
 
-    s_low = s.lower()
     return bool(
         re.search(r"\b\d{1,2}:\d{2}\b", s_low)
         or re.search(r"\b\d{1,2}\.\d{2}\s*uhr\b", s_low)
@@ -125,8 +128,6 @@ def _parse_iso_strict(s: str, tz: ZoneInfo) -> Optional[datetime]:
 
     - Handles trailing 'Z' as UTC
     - Naive datetimes get default_tz (Europe/Zurich)
-
-    Does NOT use dateparser to avoid locale/timezone ambiguities.
     """
     if not s:
         return None
@@ -197,19 +198,6 @@ def parse_datetime_or_range(
 ) -> Tuple[Optional[datetime], Optional[datetime]]:
     """
     Returns (start_local, end_local) as timezone-aware datetimes.
-
-    Supports:
-      - '2026-01-22T15:00 | 2026-01-22T17:00' (ISO pipe-separated range)
-      - '2026-01-22T15:00' or '2026-01-22' (single ISO datetime or date)
-      - 'DD.MM.YYYY - DD.MM.YYYY' (numeric range)
-      - '22. Jan. 2026, 18.00 Uhr - 23.00 Uhr' (single DE with time)
-      - '6. Jan. 2026 - 10. Feb. 2026, 14.00 Uhr - 14.45 Uhr, 45 Minuten' (range DE with optional time)
-      - fallback: dateparser for simpler formats
-
-    Notes:
-      - ISO formats use fromisoformat (timezone-safe, no dateparser ambiguity)
-      - For date-only ranges (no time): end_local becomes 23:59 on end date (local timezone).
-      - For date-only singles: dateparser usually returns 00:00; we treat it as "date precision" later.
     """
     s = (datetime_raw or "").strip()
     if not s:
@@ -217,7 +205,7 @@ def parse_datetime_or_range(
 
     tz = ZoneInfo(tz_name)
 
-    # 0a) ISO pipe-separated range: "2026-01-22T15:00 | 2026-01-22T17:00"
+    # 0a) ISO pipe-separated range
     m = _ISO_PIPE_RANGE_RE.match(s)
     if m:
         start_dt = _parse_iso_strict(m.group(1), tz)
@@ -225,14 +213,14 @@ def parse_datetime_or_range(
         if start_dt:
             return start_dt, end_dt
 
-    # 0b) Single ISO datetime: "2026-01-22T15:00" or "2026-01-22"
+    # 0b) Single ISO
     m = _ISO_SINGLE_RE.match(s)
     if m:
         start_dt = _parse_iso_strict(m.group(1), tz)
         if start_dt:
             return start_dt, None
 
-    # 1) Numeric date range: "06.01.2026 - 10.02.2026"
+    # 1) Numeric date range
     m = _NUM_RANGE_RE.match(s)
     if m:
         start_date = _parse_with_dateparser(m.group(1))
@@ -242,7 +230,7 @@ def parse_datetime_or_range(
             end_local = end_date.astimezone(tz).replace(hour=23, minute=59, second=0, microsecond=0)
             return start_local, end_local
 
-    # 2) Range with German month names (+ optional time window)
+    # 2) Range with German month names (+ optional time)
     m = _RANGE_DE_RE.search(s)
     if m:
         sm = _month_to_int(m.group("smon"))
@@ -257,7 +245,6 @@ def parse_datetime_or_range(
             start_h = int(sh) if sh else 0
             start_m = int(smin) if smin else 0
 
-            # If end time exists, use it; otherwise, end-of-day.
             if eh and emin:
                 end_h = int(eh); end_m = int(emin)
             else:
@@ -288,7 +275,7 @@ def parse_datetime_or_range(
                 )
             return start_local, end_local
 
-    # 4) Fallback: dateparser for single date/datetime
+    # 4) Fallback
     start_local = _parse_with_dateparser(s)
     return start_local, None
 
@@ -304,16 +291,10 @@ def raw_to_normalized(
     """
     Core normalization.
 
-    - parse start/end (local tz)
-    - convert to UTC
-    - determine event_type + precision flags
-
-    IMPORTANT FIX:
-    - If end_local exists but is SAME DAY as start_local -> classify as "single"
-      (still keep end_at, so duration is preserved).
-    - Only classify as "date_range" if it spans multiple days.
+    Fixes:
+    - date_precision is derived from BOTH raw hints and parsed datetime values
+      (prevents Eventbrite time rows being misclassified as 'date').
     """
-
     start_local, end_local = parse_datetime_or_range(raw.datetime_raw, tz_name=TIMEZONE)
     if not start_local:
         return None
@@ -326,15 +307,34 @@ def raw_to_normalized(
     if end_local and end_local.tzinfo is None:
         end_local = end_local.replace(tzinfo=tz)
 
+    # Convert to UTC
     start_at_utc = start_local.astimezone(timezone.utc)
     end_at_utc = end_local.astimezone(timezone.utc) if end_local else None
 
     raw_s = (raw.datetime_raw or "").strip()
-    has_time = _has_time_hint(raw_s)
+    raw_has_time = _has_time_hint(raw_s)
 
-    # --------------------------------------------------------
-    # Classification FIX (single-day w/ end time == "single")
-    # --------------------------------------------------------
+    # Determine if parsed datetimes actually contain "meaningful time"
+    # - For date-only singles, start_local is typically 00:00
+    # - For date-only ranges we intentionally set end_local to 23:59
+    parsed_start_has_time = (start_local.hour, start_local.minute) != (0, 0)
+
+    parsed_end_has_meaningful_time = False
+    if end_local:
+        # If it's a real single-day event with end time, this will be true (not just 23:59 default)
+        if end_local.date() == start_local.date():
+            parsed_end_has_meaningful_time = True
+        else:
+            # multi-day ranges:
+            # only treat as having "time" if start isn't 00:00 or end isn't the 23:59 default
+            parsed_end_has_meaningful_time = (
+                (start_local.hour, start_local.minute) != (0, 0)
+                or (end_local.hour, end_local.minute) != (23, 59)
+            )
+
+    has_time = bool(raw_has_time or parsed_start_has_time or parsed_end_has_meaningful_time)
+
+    # Event type classification
     if end_local:
         if end_local.date() == start_local.date():
             event_type = "single"
@@ -343,9 +343,7 @@ def raw_to_normalized(
     else:
         event_type = "single"
 
-    # ✅ Precision flags:
-    # - If there’s time info => datetime precision, not all-day
-    # - If only date info => date precision, all-day
+    # Precision flags
     if has_time:
         is_all_day = False
         date_precision = "datetime"
@@ -380,4 +378,5 @@ def raw_to_normalized(
         description=raw.description_raw.strip() if raw.description_raw else None,
         canonical_url=canonical_url,
         last_seen_at=now_utc,
+        extra=raw.extra or {},  # ✅ image_url survives
     )

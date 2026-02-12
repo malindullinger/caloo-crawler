@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Any, Dict
+from typing import Any, Dict, Optional
+
 from pydantic import BaseModel, Field, HttpUrl
 
 
@@ -23,9 +24,9 @@ class NormalizedEvent(BaseModel):
     external_id: str
     source_id: str
 
-    event_type: str = "single"         # single | date_range | recurring | multi_session | open_window | tbd
+    event_type: str = "single"
     is_all_day: bool = False
-    date_precision: str = "datetime"   # datetime | date | unknown
+    date_precision: str = "datetime"
 
     title: str
     start_at: datetime
@@ -44,3 +45,5 @@ class NormalizedEvent(BaseModel):
     description: Optional[str] = None
     canonical_url: str
     last_seen_at: datetime
+
+    extra: Dict[str, Any] = Field(default_factory=dict)

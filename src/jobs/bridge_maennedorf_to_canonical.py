@@ -1,160 +1,210 @@
-"""
-Bridge Maennedorf events to canonical schema (happening/offering/occurrence).
+# src/jobs/bridge_maennedorf_to_source_happenings.py
 
-TIER B SOURCE — MUNICIPAL EXCEPTION
-===================================
-Classification: Tier B (Explicit text-based exception)
-Decision: 2026-02-09
-Status: Explicitly approved for text-based parsing
-
-This source does NOT provide structured datetime (no JSON-LD, no <time>, no API).
-Text heuristics are allowed ONLY for this source with strict constraints:
-- Pattern: "D. Mon. YYYY, HH.MM Uhr - HH.MM Uhr"
-- No inference, no defaults, no guessing
-- If parsing fails → date_precision='date', times=NULL
-
-See docs/tier-b-sources.md for full constraints.
-"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+import argparse
 import hashlib
+from datetime import datetime
 from typing import Any, Dict, Optional
 
-from src.storage import supabase
+import pytz
 
-SOURCE_ID = "maennedorf_portal"
-TZ = "Europe/Zurich"
-ZURICH = ZoneInfo(TZ)
-
-DRY_RUN = False  # Set True to log without writing
+from src.db import get_supabase  # adjust if your helper differs
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+TZ_NAME = "Europe/Zurich"
+TZ = pytz.timezone(TZ_NAME)
+
+SKIP_TITLES_EXACT = {"Kopfzeile"}
 
 
-def short_id(s: str, n: int = 24) -> str:
-    """Stable short id (helps if public_id has length limits)."""
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:n]
-
-
-def make_public_id(kind: str, ext_id: str, extra: str = "") -> str:
-    base = f"{SOURCE_ID}:{kind}:{ext_id}{(':' + extra) if extra else ''}"
-    return f"{SOURCE_ID}:{kind}:{short_id(base)}"
-
-
-def safe_upsert(table: str, payload: Dict[str, Any], on_conflict: str) -> Dict[str, Any]:
-    if DRY_RUN:
-        print(f"[DRY_RUN] UPSERT {table} on {on_conflict}: {payload}")
-        return {"id": "dry-run-id"}
-    res = supabase.from_(table).upsert(payload, on_conflict=on_conflict).execute()
-    if not res.data:
-        raise RuntimeError(f"Upsert returned no data for {table}: {payload}")
-    return res.data[0]
-
-
-def zurich_date(dt_iso: str) -> Optional[str]:
-    if not dt_iso:
+def _clean(s: Optional[str]) -> Optional[str]:
+    if s is None:
         return None
-    dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZURICH)
-    return dt.astimezone(ZURICH).date().isoformat()
+    s = s.strip()
+    return s or None
+
+
+def should_skip_title(title: Optional[str]) -> bool:
+    t = (title or "").strip()
+    if not t:
+        return True
+    if t in SKIP_TITLES_EXACT:
+        return True
+    return False
+
+
+def sha32(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def ensure_external_id(
+    source_id: str,
+    events_external_id: Optional[str],
+    item_url: Optional[str],
+    title_raw: Optional[str],
+    start_date_local: Optional[str],
+    location_raw: Optional[str],
+) -> str:
+    """
+    Always return a stable, non-empty external_id for upsert idempotency.
+    """
+    if events_external_id and events_external_id.strip():
+        return events_external_id.strip()
+
+    if item_url and item_url.strip():
+        return sha32(f"{source_id}|url|{item_url.strip()}")
+
+    # last resort fallback (should be rare — better to fix ingestion to always have item_url)
+    return sha32(
+        f"{source_id}|fallback|{(title_raw or '').strip()}|{start_date_local or ''}|{(location_raw or '').strip()}"
+    )
+
+
+def to_local_date_iso(dt: Optional[str]) -> Optional[str]:
+    """
+    dt: ISO string (timestamptz coming out of Supabase is typically ISO).
+    Returns YYYY-MM-DD in Europe/Zurich.
+    """
+    if not dt:
+        return None
+    # Supabase often returns ISO like "2026-02-11T09:00:00+00:00"
+    parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+    local = parsed.astimezone(TZ)
+    return local.date().isoformat()
 
 
 def main() -> None:
-    print("=== Bridge Maennedorf -> canonical (happening/offering/occurrence) ===")
-    print(f"Source: {SOURCE_ID} (TIER B - text heuristics)")
-    print(f"TZ: {TZ} | DRY_RUN: {DRY_RUN}\n")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--limit", type=int, default=500)
+    ap.add_argument("--source-id", default="maennedorf_portal")
+    args = ap.parse_args()
 
-    ev_res = (
-        supabase
-        .from_("events")
-        .select("external_id,title,start_at,end_at,date_precision,source_id")
-        .eq("source_id", SOURCE_ID)
+    sb = get_supabase()
+
+    # Pull from normalized events
+    res = (
+        sb.table("events")
+        .select("*")
+        .eq("source_id", args.source_id)
+        .limit(args.limit)
         .execute()
     )
-    events = ev_res.data or []
-    print(f"Found {len(events)} rows in public.events for {SOURCE_ID}\n")
-    if not events:
-        return
+    rows = res.data or []
 
-    now_iso = utc_now_iso()
-    bridged = 0
+    upserts: list[Dict[str, Any]] = []
     skipped = 0
 
-    for e in events:
-        ext_id = e["external_id"]
-        title = (e.get("title") or "Untitled").strip()
-        start_at = e.get("start_at")
-        end_at = e.get("end_at")
-
-        if not start_at:
-            print(f"Skip {ext_id[:12]}… (no start_at)")
+    for e in rows:
+        title_raw = _clean(e.get("title")) or _clean(e.get("title_raw"))
+        if should_skip_title(title_raw):
             skipped += 1
             continue
 
-        # Skip if end_at is before start_at (data quality issue)
-        if end_at and start_at:
-            from datetime import datetime as dt
-            try:
-                start_dt = dt.fromisoformat(start_at.replace("Z", "+00:00"))
-                end_dt = dt.fromisoformat(end_at.replace("Z", "+00:00"))
-                if end_dt < start_dt:
-                    print(f"Skip {ext_id[:12]}… (end_at before start_at)")
-                    skipped += 1
-                    continue
-            except ValueError:
-                pass
+        item_url = _clean(e.get("item_url")) or _clean(e.get("url"))
+        location_raw = _clean(e.get("location_raw")) or _clean(e.get("location_text"))
+        description_raw = _clean(e.get("description_raw")) or _clean(e.get("description"))
 
-        # 1) HAPPENING
-        happening_pid = make_public_id("happening", ext_id)
-        happening_payload = {
-            "public_id": happening_pid,
-            "happening_kind": "event",
-            "title": title,
-            "visibility_status": "published",
-            "updated_at": now_iso,
-        }
-        happening = safe_upsert("happening", happening_payload, on_conflict="public_id")
-        happening_id = happening["id"]
+        # These should already be timestamptz in your `events` table if you normalized correctly.
+        start_at = e.get("start_at")  # keep as-is (ISO string or None)
+        end_at = e.get("end_at")
 
-        # 2) OFFERING
-        offering_pid = make_public_id("offering", ext_id, "default")
-        start_date_local = zurich_date(start_at)
-        end_date_local = zurich_date(end_at) if end_at else start_date_local
+        # Must satisfy start_date_local_required for queued rows:
+        start_date_local = e.get("start_date_local") or to_local_date_iso(start_at)
+        end_date_local = e.get("end_date_local") or to_local_date_iso(end_at)  # optional
 
-        offering_payload = {
-            "public_id": offering_pid,
-            "happening_id": happening_id,
-            "offering_type": "one_off",
-            "timezone": TZ,
-            "start_date": start_date_local,
-            "end_date": end_date_local,
-            "updated_at": now_iso,
-        }
-        offering = safe_upsert("offering", offering_payload, on_conflict="public_id")
-        offering_id = offering["id"]
+        if not start_date_local:
+            # Hard skip because queued row would violate constraint
+            skipped += 1
+            continue
 
-        # 3) OCCURRENCE
-        occ_pid = make_public_id("occ", ext_id, start_at)
-        occurrence_payload = {
-            "public_id": occ_pid,
-            "offering_id": offering_id,
+        # Set date_precision in a way that won’t violate time_contract
+        date_precision = "time" if start_at else "date"
+        if date_precision == "date":
+            # safest: do not set start_at/end_at unless precision is 'time'
+            start_at = None
+            end_at = None
+
+        events_external_id = _clean(e.get("external_id"))
+        external_id = ensure_external_id(
+            source_id=args.source_id,
+            events_external_id=events_external_id,
+            item_url=item_url,
+            title_raw=title_raw,
+            start_date_local=start_date_local,
+            location_raw=location_raw,
+        )
+
+        # A stable content hash can be useful (you also have a unique index on (source_id, content_hash))
+        content_hash = sha32(
+            "|".join(
+                [
+                    args.source_id,
+                    external_id,
+                    title_raw or "",
+                    start_date_local or "",
+                    item_url or "",
+                    location_raw or "",
+                ]
+            )
+        )
+
+        payload: Dict[str, Any] = {
+            # Required / identity
+            "source_id": args.source_id,
+            "source_type": "crawler",     # matches default/check
+            "source_tier": "B",           # bridge-normalized (tier B); must be allowed by your check
+
+            "external_id": external_id,
+
+            # Raw-ish fields for provenance / debugging
+            "title_raw": title_raw,
+            "datetime_raw": _clean(e.get("datetime_raw")),
+            "location_raw": location_raw,
+            "description_raw": description_raw,
+            "item_url": item_url,
+
+            # Time contract fields
+            "date_precision": date_precision,
             "start_at": start_at,
             "end_at": end_at,
-            "status": "scheduled",
-            "notes": f"bridged_from={SOURCE_ID} (tier_b:text_heuristic)",
-            "updated_at": now_iso,
+            "timezone": TZ_NAME,
+            "start_date_local": start_date_local,
+            "end_date_local": end_date_local,
+
+            # Optional helpers
+            "extraction_method": "bridge_events_to_source_happenings",
+            "content_hash": content_hash,
+
+            # State
+            "status": "queued",
+            "error_message": None,
         }
-        safe_upsert("occurrence", occurrence_payload, on_conflict="public_id")
 
-        print(f"✅ Bridged: {title[:60]}")
-        bridged += 1
+        # remove Nones (keeps DB cleaner and avoids check edge cases on some installs)
+        payload = {k: v for k, v in payload.items() if v is not None}
+        upserts.append(payload)
 
-    print(f"\nDone. Bridged: {bridged}, Skipped: {skipped}")
+    print(
+        f"[bridge_maennedorf_to_source_happenings] source={args.source_id} fetched={len(rows)} "
+        f"upserts={len(upserts)} skipped={skipped} live={args.live}"
+    )
+
+    if not args.live:
+        for p in upserts[:5]:
+            print(
+                "sample:",
+                {k: p.get(k) for k in ("source_id", "external_id", "title_raw", "start_date_local", "date_precision", "start_at", "status", "item_url")},
+            )
+        return
+
+    sb.table("source_happenings").upsert(
+        upserts,
+        on_conflict="source_id,external_id",
+    ).execute()
+
+    print("[bridge_maennedorf_to_source_happenings] upsert complete")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,13 @@ except Exception:  # pragma: no cover
 ZURICH_TZ = "Europe/Zurich"
 ZURICH = ZoneInfo(ZURICH_TZ) if ZoneInfo else None
 
+# Pipeline statuses for source_happenings (Phase 1)
+# - queued: has minimum evidence to attempt canonicalization (date derived)
+# - needs_review: contract violation or insufficient evidence
+# - processed: set later by merge loop (linked/created/rejected)
+STATUS_QUEUED = "queued"
+STATUS_NEEDS_REVIEW = "needs_review"
+
 # Minimal German month map (canonicalization must be independent of crawler code)
 GERMAN_MONTHS = {
     "jan": 1, "januar": 1,
@@ -170,7 +177,10 @@ def sync_to_source_happenings(
         (2) events.datetime_raw (if present) -> parse date
       Never parse from title.
 
-    - If no date can be derived -> status='needs_review' (not pending)
+    STATUS POLICY (Phase 1):
+    - If a usable date can be derived -> status='queued' (ready for canonicalization loop)
+    - If no date can be derived -> status='needs_review'
+    - If date_precision contract is violated -> status='needs_review'
     """
     result = SyncResult(dry_run=dry_run)
 
@@ -199,22 +209,26 @@ def sync_to_source_happenings(
             end_at_dt = _parse_iso_datetime(ev.get("end_at") or "")
             end_date_local = _to_zurich_date(end_at_dt) if end_at_dt else None
 
-            # status gating
-            status = "pending" if start_date_local is not None else "needs_review"
+            # Status gating:
+            # - queued if we have a usable date
+            # - needs_review if we cannot derive a date
+            status = STATUS_QUEUED if start_date_local is not None else STATUS_NEEDS_REVIEW
 
             # --- Time contract (migration 008) ---
             dp = ev.get("date_precision") or "datetime"
             start_at_out = ev.get("start_at")
             end_at_out = ev.get("end_at")
+
             if dp == "date":
                 # date-only: timestamps must be NULL
                 start_at_out = None
                 end_at_out = None
-            elif dp == "datetime" and not start_at_out:
-                # datetime precision but no start_at: needs review
-                status = "needs_review"
+            elif dp == "datetime":
+                # datetime precision must have explicit start_at evidence
+                if not start_at_out:
+                    status = STATUS_NEEDS_REVIEW
 
-            if status == "needs_review":
+            if status == STATUS_NEEDS_REVIEW:
                 result.needs_review += 1
 
             # external_id handling:
@@ -228,11 +242,16 @@ def sync_to_source_happenings(
                     seed = f"{ev_source_id}|{ev.get('title')}|{ev.get('datetime_raw')}|{ev.get('canonical_url')}"
                     ev_external_id = "hash:" + sha256(seed.encode("utf-8")).hexdigest()[:24]
 
-            dedupe_key = derive_dedupe_key(
-                title_raw=ev.get("title"),
-                start_date_local=start_date_local,
-                location_raw=ev.get("location_name"),
-            )
+            # dedupe_key contract: must always be non-null.
+            # ev_external_id is guaranteed set above (surrogate if needed).
+            dedupe_key = ev_external_id
+            if not dedupe_key:
+                print(
+                    f"[sync] SKIP item: empty dedupe_key"
+                    f" | source_id={ev_source_id} item_url={ev.get('canonical_url')}"
+                )
+                result.errors += 1
+                continue
 
             record: Dict[str, Any] = {
                 "source_id": ev_source_id,
@@ -266,10 +285,10 @@ def sync_to_source_happenings(
                 result.upserted += 1
                 continue
 
-            # Upsert on (source_id, external_id) – we ensure external_id is never null here
+            # Upsert on (source_id, dedupe_key) – dedupe_key is always non-null
             supabase.table("source_happenings").upsert(
                 record,
-                on_conflict="source_id,external_id",
+                on_conflict="source_id,dedupe_key",
             ).execute()
 
             result.upserted += 1

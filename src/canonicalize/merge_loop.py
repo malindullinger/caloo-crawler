@@ -3,23 +3,26 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
-from datetime import datetime, timezone
 
+import httpx
 from supabase import Client, create_client
 
 from src.canonicalize.matching import (
+    CONFIDENCE_THRESHOLD,
     compute_fingerprint,
     confidence_score,
-    CONFIDENCE_THRESHOLD,
 )
 from src.canonicalize.reviews_supabase import (
     Candidate,
-    write_ambiguous_match_review,
-    mark_source_needs_review,
     ignore_open_reviews_for_source_row,
+    mark_source_needs_review,
+    write_ambiguous_match_review,
 )
 
 # ---------------------------------------------------------------------------
@@ -28,10 +31,41 @@ from src.canonicalize.reviews_supabase import (
 
 NEAR_TIE_DELTA = 0.03  # prevent wrong auto-merges
 
+# If multiple candidates hit perfect confidence, force review (avoid duplicates / wrong merges)
+PERFECT_CONFIDENCE = 1.0
+PERFECT_TIE_EPS = 1e-9  # float safety
+
 # Pipeline statuses for source_happenings (Phase 1+)
 STATUS_QUEUED = "queued"
 STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_PROCESSED = "processed"
+STATUS_PROCESSING = "processing"
+STATUS_IGNORED = "ignored"
+
+
+def execute_with_retry(rb, *, tries: int = 6, base_sleep: float = 0.5):
+    """
+    Supabase/PostgREST calls can occasionally drop HTTP/2 connections under load.
+    Wrap .execute() with retry + exponential backoff.
+    """
+    last = None
+    for attempt in range(tries):
+        try:
+            return rb.execute()
+        except (
+            httpx.RemoteProtocolError,
+            httpx.ReadTimeout,
+            httpx.ConnectError,
+            httpx.WriteError,
+        ) as e:
+            last = e
+            sleep = base_sleep * (2 ** attempt) + random.random() * 0.25
+            print(
+                f"[merge_loop] transient http error: {type(e).__name__} "
+                f"attempt={attempt+1}/{tries} sleep={sleep:.2f}s"
+            )
+            time.sleep(sleep)
+    raise last  # type: ignore[misc]
 
 
 def source_priority_from_row(source_row: Mapping[str, Any]) -> int:
@@ -102,22 +136,52 @@ def fetch_queued_source_happenings(
 ) -> list[dict[str, Any]]:
     """
     Default queue = STATUS_QUEUED.
-    Optionally include STATUS_NEEDS_REVIEW (useful for Phase-1 cleanup passes),
-    but keep it off by default to avoid repeatedly reprocessing true ambiguity.
+    Optionally include STATUS_NEEDS_REVIEW.
+
+    NOTE: We also explicitly exclude STATUS_PROCESSING so we can "claim" rows
+    and avoid reprocessing loops.
     """
     statuses = [STATUS_QUEUED]
     if include_needs_review:
         statuses.append(STATUS_NEEDS_REVIEW)
 
-    resp = (
+    resp = execute_with_retry(
         supabase.table("source_happenings")
         .select("*")
         .in_("status", statuses)
         .order("created_at", desc=False)
         .limit(limit)
-        .execute()
     )
     return resp.data or []
+
+
+def claim_source_happenings(
+    supabase: Client,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    dry_run: bool,
+) -> None:
+    """
+    Mark fetched rows as STATUS_PROCESSING so we never refetch the same batch forever.
+    In DRY RUN, do nothing.
+    """
+    if dry_run:
+        return
+
+    ids = [str(r["id"]) for r in rows if r.get("id") is not None]
+    if not ids:
+        return
+
+    execute_with_retry(
+        supabase.table("source_happenings")
+        .update(
+            {
+                "status": STATUS_PROCESSING,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .in_("id", ids)
+    )
 
 
 def fetch_candidate_bundles(
@@ -140,15 +204,14 @@ def fetch_candidate_bundles(
     if not start_date:
         return []
 
-    # Fetch offerings whose date window contains the source date
     offerings = (
-        supabase.table("offering")
-        .select("*, happening(*)")
-        .lte("start_date", start_date)
-        .gte("end_date", start_date)
-        .limit(200)
-        .execute()
-        .data
+        execute_with_retry(
+            supabase.table("offering")
+            .select("*, happening(*)")
+            .lte("start_date", start_date)
+            .gte("end_date", start_date)
+            .limit(200)
+        ).data
         or []
     )
 
@@ -160,12 +223,12 @@ def fetch_candidate_bundles(
 
     if offering_ids:
         occ_rows = (
-            supabase.table("occurrence")
-            .select("id,offering_id,venue_id,start_at,end_at,status")
-            .in_("offering_id", offering_ids)
-            .limit(2000)
-            .execute()
-            .data
+            execute_with_retry(
+                supabase.table("occurrence")
+                .select("id,offering_id,venue_id,start_at,end_at,status")
+                .in_("offering_id", offering_ids)
+                .limit(2000)
+            ).data
             or []
         )
 
@@ -175,7 +238,6 @@ def fetch_candidate_bundles(
                 continue
             occ_by_offering.setdefault(str(oid), []).append(occ)
 
-    # Gather venue names
     venue_name_by_id: dict[str, str] = {}
     venue_ids = {
         str(occ.get("venue_id"))
@@ -186,12 +248,12 @@ def fetch_candidate_bundles(
 
     if venue_ids:
         venue_rows = (
-            supabase.table("venue")
-            .select("id,name")
-            .in_("id", list(venue_ids))
-            .limit(2000)
-            .execute()
-            .data
+            execute_with_retry(
+                supabase.table("venue")
+                .select("id,name")
+                .in_("id", list(venue_ids))
+                .limit(2000)
+            ).data
             or []
         )
         venue_name_by_id = {
@@ -211,15 +273,12 @@ def fetch_candidate_bundles(
         if not happening:
             continue
 
-        # IMPORTANT: exclude archived canonicals from matching pool
         if happening.get("visibility_status") == "archived":
             continue
 
-        # Pick one representative occurrence for this offering
         occs = occ_by_offering.get(str(offering.get("id")), [])
         best_occ = _pick_best_occurrence_for_offering(occs, source_start_at=source_start_at)
 
-        # Enrich offering with occurrence fields (for future scoring extensions)
         if best_occ:
             offering["__occ_start_at"] = best_occ.get("start_at")
             offering["__occ_end_at"] = best_occ.get("end_at")
@@ -230,7 +289,6 @@ def fetch_candidate_bundles(
             if venue_id is not None:
                 venue_name = venue_name_by_id.get(str(venue_id)) or ""
                 if venue_name:
-                    # Enrich happening for current confidence_score() venue use
                     happening["__venue_name"] = venue_name
 
         bundles.append({"happening": happening, "offering": offering})
@@ -246,7 +304,6 @@ def decide_match(
     source_row: Mapping[str, Any],
     candidate_bundles: Sequence[Mapping[str, Any]],
 ) -> MatchDecision:
-    # Keep only the best score per happening_id to avoid duplicate candidates
     best_by_happening: dict[str, float] = {}
 
     for bundle in candidate_bundles:
@@ -269,10 +326,18 @@ def decide_match(
     if not scored:
         return MatchDecision(kind="create")
 
-    top = scored[0].confidence
-    second = scored[1].confidence if len(scored) > 1 else None
+    top = float(scored[0].confidence)
+    second = float(scored[1].confidence) if len(scored) > 1 else None
 
     if top < CONFIDENCE_THRESHOLD:
+        return MatchDecision(kind="review", candidates=scored[:10])
+
+    perfect = [
+        c
+        for c in scored
+        if abs(float(c.confidence) - PERFECT_CONFIDENCE) <= PERFECT_TIE_EPS
+    ]
+    if len(perfect) >= 2:
         return MatchDecision(kind="review", candidates=scored[:10])
 
     if second is not None and (top - second) < NEAR_TIE_DELTA:
@@ -298,39 +363,41 @@ def create_happening_schedule_occurrence(
 
     Returns: happening_id
     """
-    # 1) Happening
     happening_payload = {
         "title": source_row.get("title_raw"),
         "description": source_row.get("description_raw"),
         "visibility_status": "draft",  # safe default
     }
 
-    happening = supabase.table("happening").insert(happening_payload).execute().data[0]
+    happening = execute_with_retry(
+        supabase.table("happening").insert(happening_payload)
+    ).data[0]
     happening_id = happening["id"]
 
-    # 2) Offering (schedule)
     offering_payload = {
         "happening_id": happening_id,
-        "offering_type": "one_off",  # aligns with DB + constraints
+        "offering_type": "one_off",
         "start_date": source_row.get("start_date_local"),
         "end_date": source_row.get("end_date_local") or source_row.get("start_date_local"),
         "timezone": source_row.get("timezone"),
     }
 
-    offering = supabase.table("offering").insert(offering_payload).execute().data[0]
+    offering = execute_with_retry(
+        supabase.table("offering").insert(offering_payload)
+    ).data[0]
     offering_id = offering["id"]
 
-    # 3) Occurrence (instance)
     occurrence_payload = {
         "offering_id": offering_id,
         "start_at": source_row.get("start_at"),
         "end_at": source_row.get("end_at"),
         "status": "scheduled",
     }
-
-    # IMPORTANT: date-only rows keep start_at/end_at = NULL
     occurrence_payload = {k: v for k, v in occurrence_payload.items() if v is not None}
-    supabase.table("occurrence").insert(occurrence_payload).execute()
+
+    execute_with_retry(
+        supabase.table("occurrence").insert(occurrence_payload)
+    )
 
     return str(happening_id)
 
@@ -354,7 +421,10 @@ def link_happening_source(
         "merged_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    supabase.table("happening_sources").upsert(payload, on_conflict="source_happening_id").execute()
+    execute_with_retry(
+        supabase.table("happening_sources")
+        .upsert(payload, on_conflict="source_happening_id")
+    )
 
 
 def mark_source_processed(
@@ -362,7 +432,39 @@ def mark_source_processed(
     supabase: Client,
     source_happening_id: str,
 ) -> None:
-    supabase.table("source_happenings").update({"status": STATUS_PROCESSED}).eq("id", source_happening_id).execute()
+    execute_with_retry(
+        supabase.table("source_happenings")
+        .update(
+            {
+                "status": STATUS_PROCESSED,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", source_happening_id)
+    )
+
+
+def mark_source_processing_failed(
+    *,
+    supabase: Client,
+    source_happening_id: str,
+    error_message: str,
+) -> None:
+    """
+    If a row was claimed as PROCESSING but something crashes, we want it to
+    be visible again. Put it back to NEEDS_REVIEW with an error message.
+    """
+    execute_with_retry(
+        supabase.table("source_happenings")
+        .update(
+            {
+                "status": STATUS_NEEDS_REVIEW,
+                "error_message": (error_message or "")[:500],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", source_happening_id)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -381,105 +483,139 @@ def run_merge_loop(
     run_id = str(uuid4())
 
     counts = {
-        "queued": 0,
+        "queued": 0,   # total fetched across loops
         "merged": 0,
         "created": 0,
         "review": 0,
         "skipped": 0,
+        "claimed": 0,
+        "errors": 0,
     }
 
-    rows = fetch_queued_source_happenings(
-        supabase,
-        limit=batch_size,
-        include_needs_review=include_needs_review,
-    )
-    counts["queued"] = len(rows)
+    while True:
+        rows = fetch_queued_source_happenings(
+            supabase,
+            limit=batch_size,
+            include_needs_review=include_needs_review,
+        )
 
-    for source_row in rows:
-        fingerprint = compute_fingerprint(source_row)
+        print(f"[merge_loop] fetched_batch={len(rows)} include_needs_review={include_needs_review}")
 
-        candidate_bundles = fetch_candidate_bundles(supabase, source_row)
-        decision = decide_match(source_row, candidate_bundles)
+        if not rows:
+            break
 
-        if decision.kind == "review":
-            counts["review"] += 1
-            if not dry_run:
-                mark_source_needs_review(
-                    supabase=supabase,
-                    source_happening_id=str(source_row["id"]),
-                )
-                write_ambiguous_match_review(
-                    supabase=supabase,
-                    run_id=run_id,
-                    source_row=source_row,
-                    fingerprint=fingerprint,
-                    candidates=decision.candidates or [],
-                    threshold=CONFIDENCE_THRESHOLD,
-                    code_version=code_version,
-                    environment=environment,
-                )
-            continue
+        counts["queued"] += len(rows)
 
-        if decision.kind == "create":
-            counts["created"] += 1
-            if not dry_run:
-                happening_id = create_happening_schedule_occurrence(
-                    supabase=supabase,
-                    source_row=source_row,
-                )
-                link_happening_source(
-                    supabase=supabase,
-                    happening_id=happening_id,
-                    source_row=source_row,
-                    is_primary=True,
-                )
-                mark_source_processed(
-                    supabase=supabase,
-                    source_happening_id=str(source_row["id"]),
-                )
-                ignore_open_reviews_for_source_row(
-                    supabase=supabase,
-                    source_happening_id=str(source_row["id"]),
-                )
-            continue
+        # ✅ Claim rows to avoid infinite refetch loops
+        try:
+            claim_source_happenings(supabase, rows, dry_run=dry_run)
+            counts["claimed"] += len(rows) if not dry_run else 0
+        except Exception as e:
+            # If claiming fails, bail out to avoid spinning forever.
+            print(f"[merge_loop] ERROR claiming batch: {repr(e)}")
+            counts["errors"] += 1
+            break
 
-        if decision.kind == "merge":
-            counts["merged"] += 1
-            if not dry_run:
-                if not decision.best_happening_id:
-                    # Should never happen, but prevent silent bad writes
-                    mark_source_needs_review(
-                        supabase=supabase,
-                        source_happening_id=str(source_row["id"]),
-                    )
-                    write_ambiguous_match_review(
-                        supabase=supabase,
-                        run_id=run_id,
-                        source_row=source_row,
-                        fingerprint=fingerprint,
-                        candidates=decision.candidates or [],
-                        threshold=CONFIDENCE_THRESHOLD,
-                        code_version=code_version,
-                        environment=environment,
-                    )
+        for source_row in rows:
+            source_id = str(source_row.get("id") or "")
+            try:
+                fingerprint = compute_fingerprint(source_row)
+                candidate_bundles = fetch_candidate_bundles(supabase, source_row)
+                decision = decide_match(source_row, candidate_bundles)
+
+                if decision.kind == "review":
+                    counts["review"] += 1
+                    if not dry_run:
+                        mark_source_needs_review(
+                            supabase=supabase,
+                            source_happening_id=source_id,
+                        )
+                        write_ambiguous_match_review(
+                            supabase=supabase,
+                            run_id=run_id,
+                            source_row=source_row,
+                            fingerprint=fingerprint,
+                            candidates=decision.candidates or [],
+                            threshold=CONFIDENCE_THRESHOLD,
+                            code_version=code_version,
+                            environment=environment,
+                        )
                     continue
 
-                link_happening_source(
-                    supabase=supabase,
-                    happening_id=decision.best_happening_id,
-                    source_row=source_row,
-                )
-                mark_source_processed(
-                    supabase=supabase,
-                    source_happening_id=str(source_row["id"]),
-                )
-                ignore_open_reviews_for_source_row(
-                    supabase=supabase,
-                    source_happening_id=str(source_row["id"]),
-                )
-            continue
+                if decision.kind == "create":
+                    counts["created"] += 1
+                    if not dry_run:
+                        happening_id = create_happening_schedule_occurrence(
+                            supabase=supabase,
+                            source_row=source_row,
+                        )
+                        link_happening_source(
+                            supabase=supabase,
+                            happening_id=happening_id,
+                            source_row=source_row,
+                            is_primary=True,
+                        )
+                        mark_source_processed(
+                            supabase=supabase,
+                            source_happening_id=source_id,
+                        )
+                        ignore_open_reviews_for_source_row(
+                            supabase=supabase,
+                            source_happening_id=source_id,
+                        )
+                    continue
 
-        counts["skipped"] += 1
+                if decision.kind == "merge":
+                    counts["merged"] += 1
+                    if not dry_run:
+                        if not decision.best_happening_id:
+                            mark_source_needs_review(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                            write_ambiguous_match_review(
+                                supabase=supabase,
+                                run_id=run_id,
+                                source_row=source_row,
+                                fingerprint=fingerprint,
+                                candidates=decision.candidates or [],
+                                threshold=CONFIDENCE_THRESHOLD,
+                                code_version=code_version,
+                                environment=environment,
+                            )
+                            continue
+
+                        link_happening_source(
+                            supabase=supabase,
+                            happening_id=decision.best_happening_id,
+                            source_row=source_row,
+                        )
+                        mark_source_processed(
+                            supabase=supabase,
+                            source_happening_id=source_id,
+                        )
+                        ignore_open_reviews_for_source_row(
+                            supabase=supabase,
+                            source_happening_id=source_id,
+                        )
+                    continue
+
+                counts["skipped"] += 1
+
+            except Exception as e:
+                counts["errors"] += 1
+                print(f"[merge_loop] ERROR row id={source_id}: {repr(e)}")
+                if not dry_run and source_id:
+                    # Put row back to needs_review so it remains visible.
+                    try:
+                        mark_source_processing_failed(
+                            supabase=supabase,
+                            source_happening_id=source_id,
+                            error_message=repr(e),
+                        )
+                    except Exception as e2:
+                        print(f"[merge_loop] ERROR while marking row needs_review: {repr(e2)}")
+                continue
 
     return counts
 
@@ -509,12 +645,10 @@ def _load_dotenv_if_present() -> None:
                     v = v.strip().strip('"').strip("'")
                     os.environ.setdefault(k, v)
         except Exception:
-            # If dotenv parsing fails, we still allow normal env var loading
             continue
 
 
 def _get_supabase_client() -> Client:
-    # Try local dotenv files first for developer convenience
     _load_dotenv_if_present()
 
     url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
@@ -529,7 +663,9 @@ def _get_supabase_client() -> Client:
     if not url:
         missing.append("SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)")
     if not key:
-        missing.append("SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_ANON_KEY / NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        missing.append(
+            "SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_ANON_KEY / NEXT_PUBLIC_SUPABASE_ANON_KEY"
+        )
 
     if missing:
         raise RuntimeError(
@@ -577,7 +713,9 @@ def main() -> None:
     )
 
     mode = "DRY RUN" if dry_run else "LIVE"
-    print(f"[merge_loop] mode={mode} batch_size={args.batch_size} include_needs_review={args.include_needs_review}")
+    print(
+        f"[merge_loop] mode={mode} batch_size={args.batch_size} include_needs_review={args.include_needs_review}"
+    )
     print(f"[merge_loop] counts={counts}")
 
 

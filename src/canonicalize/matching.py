@@ -76,33 +76,77 @@ def compute_fingerprint(source_row: Dict[str, Any]) -> str:
 
 def confidence_score(
     happening_row: Dict[str, Any],
-    offering_row: Dict[str, Any],
+    offering_row: Optional[Dict[str, Any]],
     source_row: Dict[str, Any],
 ) -> float:
     """
     Score how likely *source_row* matches an existing happening + offering pair.
 
-    Returns 0.0–1.0.  Compare against CONFIDENCE_THRESHOLD to decide
-    auto-merge vs. ambiguous_match_log.
+    Returns 0.0–1.0. Compare against CONFIDENCE_THRESHOLD to decide
+    auto-merge vs. review.
 
-    Weights (sum = 1.0):
+    Base weights (sum = 1.0 when all signals available):
       title   0.50
       date    0.30
       venue   0.20
+
+    IMPORTANT:
+    - Your canonical `happening` table does NOT include venue name fields.
+      Venue typically lives on `venue` / `occurrence.venue_id`.
+    - Therefore venue similarity is often unavailable at this stage.
+      To avoid "max score < threshold", we dynamically renormalize weights
+      based on which signals are actually available.
     """
     # --- title ---
     src_title = normalize_title(source_row.get("title_raw"))
     hap_title = normalize_title(happening_row.get("title"))
     title_sim = jaccard_tokens(src_title, hap_title)
+    title_available = bool(src_title and hap_title)
 
-    # --- date ---
-    src_date = source_row.get("start_date_local") or ""
-    off_date = offering_row.get("start_date_local") or ""
-    date_sim = 1.0 if (src_date and src_date == off_date) else 0.0
+    # --- date (range inclusion; no inference) ---
+    # source_happenings.start_date_local is a DATE (ISO string)
+    src_date = source_row.get("start_date_local")
+    date_sim = 0.0
+    date_available = False
+    if offering_row and src_date:
+        off_start = offering_row.get("start_date")
+        off_end = offering_row.get("end_date") or off_start
+        # if off_start/off_end are ISO date strings, lexicographic compare works
+        if off_start and off_end:
+            date_available = True
+            date_sim = 1.0 if (off_start <= src_date <= off_end) else 0.0
 
-    # --- venue ---
+    # --- venue (often unavailable in happening_row; keep conservative) ---
     src_venue = normalize_venue(source_row.get("location_raw"))
-    hap_venue = normalize_venue(happening_row.get("location_name"))
-    venue_sim = jaccard_tokens(src_venue, hap_venue)
+    # You likely don't have venue name on happening_row yet; leave empty unless you add it later.
+    # If you later enrich candidate bundles with venue name, populate e.g. happening_row["__venue_name"].
+    hap_venue = normalize_venue(happening_row.get("__venue_name"))
+    venue_sim = jaccard_tokens(src_venue, hap_venue) if (src_venue and hap_venue) else 0.0
+    venue_available = bool(src_venue and hap_venue)
 
-    return 0.50 * title_sim + 0.30 * date_sim + 0.20 * venue_sim
+    # --- dynamic weight renormalization ---
+    weights = {
+        "title": 0.50 if title_available else 0.0,
+        "date": 0.30 if date_available else 0.0,
+        "venue": 0.20 if venue_available else 0.0,
+    }
+    total_w = sum(weights.values())
+    if total_w <= 0.0:
+        return 0.0
+
+    # normalize to sum=1.0 based on available signals
+    for k in list(weights.keys()):
+        weights[k] = weights[k] / total_w
+
+    score = (
+        weights["title"] * title_sim +
+        weights["date"] * date_sim +
+        weights["venue"] * venue_sim
+    )
+
+    # clamp
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return float(score)

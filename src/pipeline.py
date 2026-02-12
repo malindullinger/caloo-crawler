@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from .sources.multi_source import fetch_and_extract
 from .normalize import raw_to_normalized
-from .storage import store_raw, upsert_event, insert_schedules
+from .storage import insert_schedules, store_raw, upsert_event
 
 
 def main() -> None:
@@ -16,6 +16,18 @@ def main() -> None:
     print("PIPELINE: fetch done")
 
     print(f"Raw events: {len(raws)}")
+
+    # ✅ DEBUG: prove whether image_url exists on RawEvent BEFORE storing
+    sample_with_images = 0
+    for r in raws[:25]:
+        img = (r.extra or {}).get("image_url")
+        if isinstance(img, str):
+            img = img.strip() or None
+        if img:
+            sample_with_images += 1
+        print("DEBUG raw.image_url:", img, "| item_url:", str(r.item_url) if r.item_url else None)
+
+    print(f"DEBUG: raws with image_url in first 25 = {sample_with_images}")
 
     normalized = []
 

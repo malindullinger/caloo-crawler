@@ -1,255 +1,306 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import re
-from datetime import date as Date
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+import os
+from datetime import date, datetime, timezone
+from typing import Any, Mapping, Optional
 
-from zoneinfo import ZoneInfo
+from supabase import Client, create_client
 
-import dateparser
-from supabase import create_client
-
-from .config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
-from .models import NormalizedEvent, RawEvent
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+from .models import RawEvent, NormalizedEvent
 
 
-def _sha256_hex(s: str) -> str:
+# -----------------------------------------------------------------------------
+# Supabase client helpers
+# -----------------------------------------------------------------------------
+
+def _load_dotenv_if_present() -> None:
+    for fname in (".env", ".env.local"):
+        if not os.path.exists(fname):
+            continue
+        try:
+            with open(fname, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    os.environ.setdefault(k, v)
+        except Exception:
+            continue
+
+
+def get_supabase() -> Client:
+    _load_dotenv_if_present()
+
+    url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    key = (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_ANON_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+    )
+
+    if not url or not key:
+        raise RuntimeError(
+            "Missing SUPABASE env vars. Need SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (preferred)."
+        )
+
+    return create_client(url, key)
+
+
+# -----------------------------------------------------------------------------
+# Small utilities
+# -----------------------------------------------------------------------------
+
+def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _stable_json(payload: Dict[str, Any]) -> str:
-    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+def _extract_image_url(extra: Mapping[str, Any] | None) -> Optional[str]:
+    if not extra:
+        return None
+    v = extra.get("image_url")
+    if isinstance(v, str):
+        v = v.strip()
+        return v or None
+    return None
 
 
-# ----------------------------
-# RAW EVENTS
-# ----------------------------
+def _derive_dedupe_key(
+    *,
+    source_id: str,
+    item_url: Optional[str],
+    external_id: Optional[str],
+) -> str:
+    """
+    Must ALWAYS return a stable, non-null key.
+
+    Strategy:
+      1) If external_id exists -> use it (stable for now)
+      2) Else use item_url
+      3) Else raise hard error (no time-based fallback allowed)
+    """
+    if external_id:
+        return _sha256(f"{source_id}|ext|{external_id}")
+    if item_url:
+        return _sha256(f"{source_id}|url|{item_url}")
+    raise ValueError(
+        f"Cannot derive dedupe_key: missing both external_id and item_url for source {source_id}"
+    )
+
+
+def _dt_iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    # Ensure timezone-aware ISO string
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.replace(microsecond=0).isoformat()
+
+
+def _date_iso(d: Optional[date]) -> Optional[str]:
+    if not d:
+        return None
+    return d.isoformat()
+
+
+def _enforce_time_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Enforces DB check constraint expectations:
+      - if date_precision != 'datetime': start_at and end_at MUST be NULL
+      - start_date_local must stay populated
+    """
+    dp = (payload.get("date_precision") or "").lower().strip()
+    if dp != "datetime":
+        payload["start_at"] = None
+        payload["end_at"] = None
+    return payload
+
+
+# -----------------------------------------------------------------------------
+# Public API used by pipeline
+# -----------------------------------------------------------------------------
+
 def store_raw(raw: RawEvent) -> None:
-    raw_payload = {
-        "title_raw": raw.title_raw,
-        "datetime_raw": raw.datetime_raw,
-        "location_raw": raw.location_raw,
-        "description_raw": raw.description_raw,
-        "item_url": str(raw.item_url) if raw.item_url else None,
-        "extra": raw.extra,
-    }
-
-    content_hash = _sha256_hex(_stable_json(raw_payload))
-
-    row = {
-        "source_id": raw.source_id,
-        "source_url": str(raw.source_url),
-        "item_url": str(raw.item_url) if raw.item_url else None,
-        "content_hash": content_hash,
-        "raw_payload": raw_payload,
-        "fetched_at": raw.fetched_at.astimezone(timezone.utc).isoformat(),
-        "status": "ok",
-        "error": None,
-    }
-
-    supabase.table("event_raw").insert(row).execute()
+    """
+    Optional: keep raw evidence elsewhere later.
+    For now this is a no-op (your canonical pipeline uses source_happenings).
+    """
+    return
 
 
-# ----------------------------
-# NORMALIZED EVENTS
-# ----------------------------
-def upsert_event(ev: NormalizedEvent) -> None:
-    now = datetime.now(timezone.utc)
+def enqueue_source_happening(ev: NormalizedEvent) -> None:
+    """
+    Upsert into source_happenings.
 
-    row = {
-        "external_id": ev.external_id,
+    IMPORTANT:
+    - Your DB has UNIQUE(source_id, external_id) (idx_source_happenings_external_unique)
+      so we must use on_conflict="source_id,external_id" when external_id is present.
+    - If external_id is missing (rare), fall back to on_conflict="source_id,dedupe_key"
+      (only works if you created that unique index too).
+    - Serialize datetimes/dates as ISO strings to avoid JSON serialization errors.
+    """
+    supabase = get_supabase()
+
+    image_url = _extract_image_url(ev.extra)
+
+    extraction_method = None
+    if isinstance(ev.extra, dict):
+        em = ev.extra.get("extraction_method")
+        if isinstance(em, str):
+            extraction_method = em.strip() or None
+
+    item_url = (ev.canonical_url or "").strip() or None
+    external_id = (ev.external_id or "").strip() or None
+
+    try:
+        dedupe_key = _derive_dedupe_key(
+            source_id=ev.source_id,
+            item_url=item_url,
+            external_id=external_id,
+        )
+    except ValueError:
+        print(
+            f"[storage] SKIP item: cannot derive dedupe_key"
+            f" | source_id={ev.source_id} external_id={external_id} item_url={item_url}"
+        )
+        return
+
+    if not dedupe_key:
+        print(
+            f"[storage] SKIP item: empty dedupe_key"
+            f" | source_id={ev.source_id} external_id={external_id} item_url={item_url}"
+        )
+        return
+
+    # Local dates (required for matching + queue)
+    start_date_local = ev.start_at.date() if ev.start_at else None
+    end_date_local = ev.end_at.date() if ev.end_at else start_date_local
+
+    payload: dict[str, Any] = {
         "source_id": ev.source_id,
-        "title": ev.title,
-        "start_at": ev.start_at.astimezone(timezone.utc).isoformat(),
-        "end_at": ev.end_at.astimezone(timezone.utc).isoformat() if ev.end_at else None,
-        "timezone": ev.timezone,
-        "location_name": ev.location_name,
-        "description": ev.description,
-        "canonical_url": ev.canonical_url,
-        "last_seen_at": ev.last_seen_at.astimezone(timezone.utc).isoformat(),
-        "updated_at": now.isoformat(),
-        "event_type": ev.event_type,
-        "is_all_day": ev.is_all_day,
+        "source_type": "crawler",
+        "source_tier": "A",
+        "external_id": external_id,
+        "title_raw": ev.title,
+        "datetime_raw": None,
+        "location_raw": getattr(ev, "location_name", None) or getattr(ev, "location_address", None),
+        "description_raw": ev.description,
         "date_precision": ev.date_precision,
+        "start_at": _dt_iso(ev.start_at),
+        "end_at": _dt_iso(ev.end_at),
+        "timezone": ev.timezone,
+        "extraction_method": extraction_method,
+        "item_url": item_url,
+        "content_hash": None,
+        "dedupe_key": dedupe_key,
+        "status": "queued",
+        "error_message": None,
+        "fetched_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "start_date_local": _date_iso(start_date_local),
+        "end_date_local": _date_iso(end_date_local),
+        "image_url": image_url,
     }
 
-    supabase.table("events").upsert(row, on_conflict="source_id,canonical_url").execute()
+    payload = _enforce_time_contract(payload)
+
+    try:
+        supabase.table("source_happenings").upsert(
+            payload,
+            on_conflict="source_id,dedupe_key",
+        ).execute()
+
+    except Exception as e:
+        print("[storage] enqueue_source_happening FAILED:", repr(e))
+        print(
+            "[storage] payload summary:",
+            {
+                "source_id": ev.source_id,
+                "external_id": external_id,
+                "item_url": item_url,
+                "dedupe_key": dedupe_key,
+                "date_precision": ev.date_precision,
+            },
+        )
+        raise
 
 
-# ----------------------------
-# EVENT SCHEDULES (PHASE 3)
-# ----------------------------
+def upsert_event(ev: NormalizedEvent) -> None:
+    """
+    For Phase 1, 'upsert_event' = enqueue a source_happening row.
+    """
+    enqueue_source_happening(ev)
+
+
+def upsert_source_happening_row(payload: dict[str, Any]) -> bool:
+    """
+    Upsert a raw dict into source_happenings.
+
+    Derives dedupe_key centrally (external_id -> item_url -> skip+log).
+    Returns True if upserted, False if skipped.
+    """
+    source_id = payload.get("source_id") or ""
+    external_id = (payload.get("external_id") or "").strip() or None
+    item_url = (payload.get("item_url") or "").strip() or None
+
+    try:
+        dedupe_key = _derive_dedupe_key(
+            source_id=source_id,
+            item_url=item_url,
+            external_id=external_id,
+        )
+    except ValueError:
+        print(
+            f"[storage] SKIP item: cannot derive dedupe_key"
+            f" | source_id={source_id} external_id={external_id} item_url={item_url}"
+        )
+        return False
+
+    if not dedupe_key:
+        print(
+            f"[storage] SKIP item: empty dedupe_key"
+            f" | source_id={source_id} external_id={external_id} item_url={item_url}"
+        )
+        return False
+
+    payload["dedupe_key"] = dedupe_key
+    payload = _enforce_time_contract(payload)
+
+    supabase = get_supabase()
+    try:
+        supabase.table("source_happenings").upsert(
+            payload,
+            on_conflict="source_id,dedupe_key",
+        ).execute()
+        return True
+    except Exception as e:
+        print("[storage] upsert_source_happening_row FAILED:", repr(e))
+        print(
+            "[storage] payload summary:",
+            {
+                "source_id": source_id,
+                "external_id": external_id,
+                "item_url": item_url,
+                "dedupe_key": dedupe_key,
+            },
+        )
+        raise
+
+
 def insert_schedules(
     *,
     event_external_id: str,
-    raw_datetime: Optional[str],
+    raw_datetime: str,
     event_type: str,
-    event_start_at_utc: datetime,
+    event_start_at_utc: Any,
+    event_end_at_utc: Any,
     event_tz: str,
-    event_end_at_utc: Optional[datetime] = None,  # accepts pipeline arg safely
 ) -> None:
     """
-    Writes ONE schedule row per event:
-    - date_range => schedule_type='window'
-        start_date_local / end_date_local from raw range,
-        start_time_local / end_time_local from raw time window if present
-    - single => schedule_type='session'
-        start_date_local + start_time_local from normalized start_at,
-        end_time_local from raw if present
-
-    IMPORTANT GUARD:
-      - If event_type == 'single' BUT normalized time is 00:00 (date-only),
-        we SKIP writing a session row to avoid duplicates / bogus sessions.
+    If you still use schedules, keep it.
+    If not, safely no-op for now.
     """
-
-    raw_s = (raw_datetime or "").strip()
-    tz = ZoneInfo(event_tz)
-
-    # Times like: "14.00", "14:00" optionally followed by "Uhr"
-    _TIME_RE = re.compile(r"(\d{1,2})[.:](\d{2})(?:\s*Uhr)?", re.IGNORECASE)
-
-    def _extract_time_window(s: str) -> tuple[Optional[str], Optional[str]]:
-        hits = _TIME_RE.findall(s or "")
-        if not hits:
-            return None, None
-
-        sh, sm = hits[0]
-        start_t = f"{int(sh):02d}:{int(sm):02d}"
-
-        end_t = None
-        if len(hits) >= 2:
-            eh, em = hits[1]
-            end_t = f"{int(eh):02d}:{int(em):02d}"
-
-        return start_t, end_t
-
-    def _parse_date_any(s: str) -> Optional[Date]:
-        """
-        Accepts:
-          - '06.01.2026'
-          - '6. Jan. 2026'
-          - '10. Feb. 2026'
-        Returns datetime.date
-        """
-        s = (s or "").strip()
-        if not s:
-            return None
-
-        dt = dateparser.parse(
-            s,
-            languages=["de", "en"],
-            settings={
-                "TIMEZONE": event_tz,
-                "RETURN_AS_TIMEZONE_AWARE": True,
-                "PREFER_DATES_FROM": "future",
-                "DATE_ORDER": "DMY",
-            },
-        )
-        return dt.date() if dt else None
-
-    # -----------------------------------------
-    # 1) Date ranges => window
-    # -----------------------------------------
-    if event_type == "date_range":
-        start_date_local: Optional[Date] = None
-        end_date_local: Optional[Date] = None
-
-        # Use the part before the first comma as the "date range"
-        # e.g. "6. Jan. 2026 - 10. Feb. 2026, 14.00 Uhr - 14.45 Uhr, ..."
-        range_part = raw_s.split(",", 1)[0].strip()
-
-        # Split by dash
-        if " - " in range_part:
-            left, right = range_part.split(" - ", 1)
-            start_date_local = _parse_date_any(left)
-            end_date_local = _parse_date_any(right)
-        else:
-            # Single-date strings like "11. Juli 2026, 9.30 Uhr - 16.00 Uhr"
-            # We treat them as a 1-day window.
-            only_date = _parse_date_any(range_part)
-            if only_date:
-                start_date_local = only_date
-                end_date_local = only_date
-
-        # If dates still missing, fall back to normalized event bounds
-        if not start_date_local:
-            start_date_local = event_start_at_utc.astimezone(tz).date()
-        if not end_date_local:
-            if event_end_at_utc:
-                end_date_local = event_end_at_utc.astimezone(tz).date()
-            else:
-                # at least keep it non-null when we can’t parse
-                end_date_local = start_date_local
-
-        # Extract time window (if present)
-        start_time_local, end_time_local = _extract_time_window(raw_s)
-
-        # If raw has no time but normalized start has a meaningful time, use it
-        if not start_time_local:
-            start_local = event_start_at_utc.astimezone(tz)
-            if not (start_local.hour == 0 and start_local.minute == 0):
-                start_time_local = start_local.strftime("%H:%M")
-
-        row = {
-            "event_external_id": event_external_id,
-            "schedule_type": "window",
-            "start_date_local": start_date_local.isoformat() if start_date_local else None,
-            "end_date_local": end_date_local.isoformat() if end_date_local else None,
-            "start_time_local": start_time_local,
-            "end_time_local": end_time_local,
-            "notes": f"date_range_raw={raw_s}",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        supabase.table("event_schedules").upsert(
-            row,
-            on_conflict="event_external_id,schedule_type",
-        ).execute()
-        return
-
-    # -----------------------------------------
-    # 2) Singles => session
-    # -----------------------------------------
-    if event_type == "single":
-        start_local = event_start_at_utc.astimezone(tz)
-
-        # ✅ Guard: avoid generating bogus midnight sessions
-        # These were previously created by "backfill_from_events_start_at=true"
-        # when the normalized event had date-only precision.
-        if start_local.hour == 0 and start_local.minute == 0:
-            return
-
-        start_date_local = start_local.date().isoformat()
-        start_time_local = start_local.strftime("%H:%M")
-
-        # End time from raw string if present (second time)
-        end_time_local = None
-        hits = _TIME_RE.findall(raw_s)
-        if len(hits) >= 2:
-            eh, em = hits[1]
-            end_time_local = f"{int(eh):02d}:{int(em):02d}"
-
-        row = {
-            "event_external_id": event_external_id,
-            "schedule_type": "session",
-            "start_date_local": start_date_local,
-            "end_date_local": None,
-            "start_time_local": start_time_local,
-            "end_time_local": end_time_local,
-            "notes": f"single_raw={raw_s}",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        supabase.table("event_schedules").upsert(
-            row,
-            on_conflict="event_external_id,schedule_type",
-        ).execute()
-        return
-
-    # Other types => do nothing for now
     return

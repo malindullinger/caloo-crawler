@@ -42,7 +42,7 @@ SOURCES: List[SourceConfig] = [
         adapter="eventbrite",
         seed_url="https://www.eventbrite.ch/d/switzerland--zurich/events/",
         timezone="Europe/Zurich",
-        max_items=20,  # Limited for testing
+        max_items=20,
     ),
 ]
 
@@ -65,7 +65,22 @@ def fetch_and_extract() -> List[RawEvent]:
             enriched.append(adapter.enrich(cfg, it))
 
         # Convert to RawEvent
-        for it in enriched:
+        for idx, it in enumerate(enriched):
+            # 🔎 TEMP DEBUG (limit to first 25 items per source)
+            if idx < 25:
+                img = (it.extra or {}).get("image_url")
+                if isinstance(img, str):
+                    img = img.strip() or None
+
+                print(
+                    f"[DEBUG {cfg.source_id}] image_url:",
+                    img,
+                    "| item_url:",
+                    getattr(it, "item_url", None),
+                    "| keys:",
+                    list((it.extra or {}).keys())[:10],
+                )
+
             out.append(
                 RawEvent(
                     source_id=cfg.source_id,

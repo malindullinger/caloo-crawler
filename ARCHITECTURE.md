@@ -70,6 +70,14 @@ An offering may produce one or more occurrences.
 
 ---
 
+### Series vs Program (important distinction)
+- **`series` (offering_type)** describes a **schedule shape** (e.g. a multi-date range or recurring pattern).
+- **Program / umbrella concepts** describe a **semantic container** (Phase 2) that may group multiple happenings under one theme (e.g. “CoolDay”, “Kino für die Chline”).
+
+Phase 1 supports `series` as a scheduling construct only. Program-level grouping is intentionally deferred to Phase 2.
+
+---
+
 #### Occurrence
 An **Occurrence** is a concrete, dated instance of an offering.
 

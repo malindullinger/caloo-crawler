@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from typing import List
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -12,77 +12,43 @@ from ..http import http_get
 from ..structured_time import extract_jsonld_event, extract_time_element
 from ..types import SourceConfig, ExtractedItem
 
-
-# Detail pages we want:
-# - /_rte/anlass/7060739
-# - /anlaesseaktuelles/7081397
 _DETAIL_PATH_RE = re.compile(r"^/(?:_rte/anlass|anlaesseaktuelles)/(\d+)$")
-
-# Escaped JSON-style paths we saw in rendered HTML:
-# "\/_rte\/anlass\/6615883"
 _ESCAPED_DETAIL_RE = re.compile(r"\\/(?:_rte\\/anlass|anlaesseaktuelles)\\/\d+")
+
+_IWEB_IMG_RE = re.compile(
+    r"(https?:\/\/api\.i-web\.ch\/public\/guest\/getImageString\/[^\s\"'>]+)",
+    re.IGNORECASE,
+)
+
+
+def _is_junk_title(title: str) -> bool:
+    t = (title or "").strip().lower()
+    if not t:
+        return True
+    return t in ("kopfzeile", "fusszeile") or t.startswith("kopfzeile") or t.startswith("fusszeile")
 
 
 class MaennedorfPortalAdapter(BaseAdapter):
-    """
-    TIER B SOURCE — MUNICIPAL EXCEPTION
-    ===================================
-    Classification: Tier B (Explicit text-based exception)
-    Decision: 2026-02-09
-    Approval: Explicitly approved for text-based datetime parsing
-
-    This source does NOT provide structured datetime (no JSON-LD, no <time>).
-    Text heuristics are QUARANTINED in this adapter only.
-    See docs/tier-b-sources.md for constraints.
-
-    Strategy:
-    - Fetch list page with JS rendering (Playwright)
-    - Extract detail URLs from href and escaped JSON strings
-    - Sort by numeric id DESC (newest first)
-    - Parse each detail page:
-        1) Try JSON-LD (never found)
-        2) Try <time> element (never found)
-        3) Fall back to text heuristic (QUARANTINED HERE)
-    """
-
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
         res = http_get(cfg.seed_url, render_js=True)
         html = res.text or ""
-
         soup = BeautifulSoup(html, "html.parser")
 
-        # ----------------------------
-        # 1) Collect normal href paths
-        # ----------------------------
         href_paths: List[str] = []
         for a in soup.find_all("a", href=True):
             h = (a.get("href") or "").strip()
             if not h:
                 continue
-
-            # drop query/hash for filtering
             path = h.split("?")[0].split("#")[0]
-
-            # keep only matching detail paths
             if _DETAIL_PATH_RE.match(path):
                 href_paths.append(path)
 
-        # ----------------------------
-        # 2) Collect escaped paths from raw HTML
-        # Example: "\\/_rte\\/anlass\\/6615883"
-        # ----------------------------
         escaped_hits = _ESCAPED_DETAIL_RE.findall(html)
         escaped_paths = [h.replace("\\/", "/") for h in escaped_hits]
         escaped_paths = [p for p in escaped_paths if _DETAIL_PATH_RE.match(p)]
 
-        # ----------------------------
-        # 3) Combine candidates (paths)
-        # ----------------------------
         candidates = href_paths + escaped_paths
 
-        # ----------------------------
-        # 4) Extract numeric id, then sort by id DESC (newest first)
-        # ----------------------------
         parsed: List[tuple[int, str]] = []
         for p in candidates:
             m = _DETAIL_PATH_RE.match(p)
@@ -92,9 +58,6 @@ class MaennedorfPortalAdapter(BaseAdapter):
 
         parsed.sort(key=lambda t: t[0], reverse=True)
 
-        # ----------------------------
-        # 5) Dedupe while keeping sorted order + build absolute URLs
-        # ----------------------------
         seen = set()
         detail_urls: List[str] = []
         for _, path in parsed:
@@ -104,69 +67,150 @@ class MaennedorfPortalAdapter(BaseAdapter):
             seen.add(abs_url)
             detail_urls.append(abs_url)
 
-        # Respect max_items
         detail_urls = detail_urls[: cfg.max_items]
 
         print("MaennedorfPortalAdapter: detail_urls:", len(detail_urls))
         if detail_urls:
             print("MaennedorfPortalAdapter: first detail url:", detail_urls[0])
 
-        # ----------------------------
-        # 6) Fetch detail pages
-        # ----------------------------
         items: List[ExtractedItem] = []
+
+        stats = {
+            "ok": 0,
+            "skip_no_title": 0,
+            "skip_junk_title": 0,
+            "skip_no_datetime": 0,
+            "skip_sitzung": 0,
+            "detail_parse_failed": 0,
+        }
+
         for url in detail_urls:
             try:
-                item = self._extract_from_detail(cfg, url)
+                item = self._extract_from_detail(cfg, url, stats=stats)
                 if item:
                     items.append(item)
+                    stats["ok"] += 1
             except Exception as e:
+                stats["detail_parse_failed"] += 1
                 print("MaennedorfPortalAdapter: detail parse failed:", url, "err:", repr(e))
                 continue
 
         print("MaennedorfPortalAdapter: items built:", len(items))
+        print("MaennedorfPortalAdapter: stats:", stats)
         return items
 
     def enrich(self, cfg: SourceConfig, item: ExtractedItem) -> ExtractedItem:
-        # fetch() already parses detail pages
         return item
 
-    def _extract_from_detail(self, cfg: SourceConfig, detail_url: str) -> ExtractedItem | None:
-        res = http_get(detail_url)
-        soup = BeautifulSoup(res.text or "", "html.parser")
+    def _extract_from_detail(self, cfg: SourceConfig, detail_url: str, stats: dict) -> ExtractedItem | None:
+        res = http_get(detail_url, render_js=True)
+        html = res.text or ""
+        soup = BeautifulSoup(html, "html.parser")
 
-        # Title: try h1 first, then fallback to <title>
+        # If the platform redirects some "anlass" ids to /sitzung/..., skip them entirely
+        final_url = str(getattr(res, "final_url", "") or detail_url)
+        try:
+            path = urlparse(final_url).path or ""
+            if "/sitzung/" in path:
+                stats["skip_sitzung"] += 1
+                return None
+        except Exception:
+            pass
+
+        # ----------------------------
+        # Title extraction:
+        # pages often contain an early H1 "Kopfzeile"; use LAST non-junk H1.
+        # ----------------------------
         title = ""
-        h1 = soup.find("h1")
-        if h1 and h1.get_text(strip=True):
-            title = h1.get_text(" ", strip=True)
-        if not title and soup.title:
-            title = soup.title.get_text(" ", strip=True)
+
+        h1_nodes = []
+        main = soup.select_one("main") or soup.select_one("article")
+        if main:
+            h1_nodes = main.select("h1")
+        if not h1_nodes:
+            h1_nodes = soup.select("h1")
+
+        h1_texts = [h.get_text(" ", strip=True) for h in h1_nodes if h.get_text(strip=True)]
+        h1_texts = [t.strip() for t in h1_texts if t and not _is_junk_title(t)]
+
+        if h1_texts:
+            title = h1_texts[-1]
+        elif soup.title:
+            tt = soup.title.get_text(" ", strip=True).strip()
+            if tt and not _is_junk_title(tt):
+                title = tt
+
         title = (title or "").strip()
         if not title:
+            stats["skip_no_title"] += 1
+            return None
+        if _is_junk_title(title):
+            stats["skip_junk_title"] += 1
             return None
 
-        # Lead container for location + fallback datetime extraction
+        # ----------------------------
+        # Image extraction (robust)
+        # ----------------------------
+        def _extract_image_url() -> str | None:
+            og = soup.select_one('meta[property="og:image"]')
+            if og and og.get("content"):
+                return urljoin(final_url, og["content"].strip())
+
+            tw = soup.select_one('meta[name="twitter:image"]')
+            if tw and tw.get("content"):
+                return urljoin(final_url, tw["content"].strip())
+
+            m = _IWEB_IMG_RE.search(html)
+            if m:
+                return m.group(1).strip()
+
+            container = soup.select_one("main") or soup.select_one("article") or soup
+            for img in container.select("img"):
+                for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+                    v = (img.get(attr) or "").strip()
+                    if not v:
+                        continue
+                    if re.search(r"(logo|icon|sprite|favicon)", v, re.I):
+                        continue
+                    return urljoin(final_url, v)
+
+                srcset = (img.get("srcset") or "").strip()
+                if srcset:
+                    first = srcset.split(",")[0].strip().split(" ")[0]
+                    if first:
+                        return urljoin(final_url, first)
+
+            for src in (soup.select("source[srcset]") or []):
+                srcset = (src.get("srcset") or "").strip()
+                if not srcset:
+                    continue
+                first = srcset.split(",")[0].strip().split(" ")[0]
+                if first and not re.search(r"(logo|icon|sprite|favicon)", first, re.I):
+                    return urljoin(final_url, first)
+
+            for el in (soup.select("[style]") or []):
+                style = (el.get("style") or "")
+                m2 = re.search(r"background-image\s*:\s*url\(['\"]?([^'\")]+)", style, re.I)
+                if m2:
+                    u = m2.group(1).strip()
+                    if u and not re.search(r"(logo|icon|sprite|favicon)", u, re.I):
+                        return urljoin(final_url, u)
+
+            return None
+
+        image_url = _extract_image_url()
+
         lead = soup.select_one(".icms-lead-container")
 
-        # =====================================================
-        # Structured extraction: JSON-LD and <time> elements
-        # =====================================================
         datetime_raw = None
         location_raw = None
         extraction_method = "text_heuristic"
 
-        # 1) Try JSON-LD first (most reliable when available)
         structured = extract_jsonld_event(soup)
         if structured and structured.start_iso:
             extraction_method = "jsonld"
-            # Use " | " separator for unambiguous parsing in normalize.py
-            if structured.end_iso:
-                datetime_raw = f"{structured.start_iso} | {structured.end_iso}"
-            else:
-                datetime_raw = structured.start_iso
+            datetime_raw = f"{structured.start_iso} | {structured.end_iso}" if structured.end_iso else structured.start_iso
 
-        # 2) Try <time> element (prefer within lead container)
         if not datetime_raw:
             now_utc = datetime.now(timezone.utc)
             structured = extract_time_element(soup, container=lead, reference_time=now_utc)
@@ -174,10 +218,6 @@ class MaennedorfPortalAdapter(BaseAdapter):
                 extraction_method = "time_element"
                 datetime_raw = structured.start_iso
 
-        # 3) Fallback to text heuristic (TIER B QUARANTINE)
-        # This text parsing is ONLY allowed for this source.
-        # Pattern: "D. Mon. YYYY, HH.MM Uhr - HH.MM Uhr"
-        # No inference, no defaults — if ambiguous, preserve unknown-time semantics.
         if not datetime_raw:
             lead_lines: List[str] = []
             if lead:
@@ -185,16 +225,11 @@ class MaennedorfPortalAdapter(BaseAdapter):
                 lead_lines = [ln.strip() for ln in lead_text.split("\n") if ln.strip()]
 
             if lead_lines:
-                # Pick the best datetime line:
-                # 1) Prefer a line containing "Uhr" (has time window)
-                # 2) Else last line that contains a year/date-like pattern
                 dt_idx = None
-
                 for i in range(len(lead_lines) - 1, -1, -1):
                     if "Uhr" in lead_lines[i]:
                         dt_idx = i
                         break
-
                 if dt_idx is None:
                     for i in range(len(lead_lines) - 1, -1, -1):
                         if re.search(r"\d{4}", lead_lines[i]) or re.search(r"\d{1,2}\.\d{1,2}\.\d{4}", lead_lines[i]):
@@ -206,35 +241,17 @@ class MaennedorfPortalAdapter(BaseAdapter):
                     if dt_idx > 0:
                         location_raw = ", ".join(lead_lines[:dt_idx])
 
-        # Extract location from lead if not already set (for structured paths)
         if not location_raw and lead:
             lead_lines = [ln.strip() for ln in lead.get_text("\n", strip=True).split("\n") if ln.strip()]
-            # For structured extraction, location is typically all lines before datetime
-            # If we used structured extraction, try to find location in lead_lines
             if lead_lines and extraction_method != "text_heuristic":
-                # Use all non-date lines as location
                 loc_lines = [ln for ln in lead_lines if not re.search(r"\d{4}", ln)]
                 if loc_lines:
                     location_raw = ", ".join(loc_lines)
 
-        # DEBUG: print the extraction for specific pages
-        if (
-            "7060739" in detail_url
-            or "7060691" in detail_url
-            or "7060775" in detail_url
-            or "7060772" in detail_url
-        ):
-            print("\n--- DEBUG extraction for", detail_url)
-            print("extraction_method =", extraction_method)
-            print("datetime_raw =", datetime_raw)
-            print("location_raw =", location_raw)
-            print("---\n")
-
-        # RawEvent requires datetime_raw to be a string
         if not datetime_raw:
+            stats["skip_no_datetime"] += 1
             return None
 
-        # Optional description: keep it short
         description_raw = None
         main = soup.select_one("main") or soup.select_one(".content") or soup.select_one("article")
         if main:
@@ -246,11 +263,12 @@ class MaennedorfPortalAdapter(BaseAdapter):
             datetime_raw=datetime_raw,
             location_raw=location_raw,
             description_raw=description_raw,
-            item_url=detail_url,
+            item_url=final_url,
             extra={
                 "adapter": "maennedorf_portal",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
+                "image_url": image_url,
             },
             fetched_at=getattr(cfg, "now_utc", None),
         )

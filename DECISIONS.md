@@ -31,7 +31,7 @@ Build a deterministic, auditable canonicalization pipeline that converts messy r
 - Technical duplicate canonicals eliminated (e.g. *Playgrounds*, *Familientanzen*)
 - Archived canonicals are excluded from all matching candidate paths
 - Ingestion noise and header artifacts removed from the review set (e.g. `title_raw = "Kopfzeile"`)
-- Remaining `needs_review` rows intentionally represent **semantic ambiguity**
+- Remaining needs_review rows intentionally represent semantic ambiguity (program/umbrella concepts; Phase 2). “Series” remains a schedule shape on offering.
   (series / umbrella / program-level concepts)
 
 ### Locked model rule (Phase 1 invariant)
