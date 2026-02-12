@@ -8,6 +8,7 @@ from .adapters.church_hub import ChurchHubAdapter
 from .adapters.vereins_directory import VereinsDirectoryAdapter
 from .adapters.kino_wildenmann import KinoWildenmannAdapter
 from .adapters.eventbrite import EventbriteAdapter
+from .adapters.elternverein_uetikon import ElternvereinUetikonAdapter
 
 
 ADAPTERS: Dict[str, Type[BaseAdapter]] = {
@@ -16,6 +17,7 @@ ADAPTERS: Dict[str, Type[BaseAdapter]] = {
     "vereins_directory": VereinsDirectoryAdapter,
     "kino_wildenmann": KinoWildenmannAdapter,
     "eventbrite": EventbriteAdapter,
+    "elternverein_uetikon": ElternvereinUetikonAdapter,
 }
 
 

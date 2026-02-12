@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Iterator, Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -13,8 +13,13 @@ from ..http import http_get
 from ..structured_time import extract_jsonld_event
 from ..types import SourceConfig, ExtractedItem
 
-_TICKET_URL_RE = re.compile(r"tickets?-\d+", re.IGNORECASE)
+
+# ---------------------------------------
+# Regexes
+# ---------------------------------------
+
 _EVENT_PATH_RE = re.compile(r"/e/", re.IGNORECASE)
+_EVENT_ID_RE = re.compile(r"-(\d{6,})", re.IGNORECASE)
 _ZH_HINT_RE = re.compile(r"(zurich|zürich|zuerich)", re.IGNORECASE)
 
 
@@ -22,33 +27,42 @@ class EventbriteAdapter(BaseAdapter):
     """
     Eventbrite adapter using JSON-LD for structured datetime extraction.
 
-    IMPORTANT:
-    Eventbrite pages often require JS rendering to expose JSON-LD / title / location reliably.
-    So we use render_js=True for listing + detail.
+    JS rendering is REQUIRED for both listing and detail pages.
     """
 
+    # ------------------------------------------------------------------
+    # Entry
+    # ------------------------------------------------------------------
+
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
+        print("[eventbrite] fetching listing:", cfg.seed_url)
+
         res = http_get(cfg.seed_url, render_js=True)
         html = res.text or ""
         soup = BeautifulSoup(html, "html.parser")
 
         detail_urls = self._extract_event_urls(soup, cfg.seed_url)
-        print(f"EventbriteAdapter: found {len(detail_urls)} event URLs")
+        print(f"[eventbrite] listing URLs found: {len(detail_urls)}")
 
         detail_urls = detail_urls[: cfg.max_items]
 
         items: List[ExtractedItem] = []
+
         for url in detail_urls:
             try:
                 item = self._extract_from_detail(url)
                 if item:
                     items.append(item)
             except Exception as e:
-                print(f"[eventbrite] detail parse failed: {url} err: {repr(e)}")
+                print(f"[eventbrite] detail parse failed: {url} | err: {repr(e)}")
                 continue
 
-        print(f"EventbriteAdapter: items built: {len(items)}")
+        print(f"[eventbrite] items built: {len(items)}")
         return items
+
+    # ------------------------------------------------------------------
+    # Listing extraction
+    # ------------------------------------------------------------------
 
     def _extract_event_urls(self, soup: BeautifulSoup, base_url: str) -> List[str]:
         urls: List[str] = []
@@ -59,15 +73,16 @@ class EventbriteAdapter(BaseAdapter):
             if not href:
                 continue
 
-            # Must look like an Eventbrite event URL
             if not _EVENT_PATH_RE.search(href):
-                continue
-            if not _TICKET_URL_RE.search(href):
                 continue
 
             clean = href.split("?")[0].split("#")[0]
             if not clean.startswith("http"):
                 clean = urljoin(base_url, clean)
+
+            # Must contain numeric event ID
+            if not _EVENT_ID_RE.search(clean):
+                continue
 
             if clean not in seen:
                 seen.add(clean)
@@ -75,36 +90,42 @@ class EventbriteAdapter(BaseAdapter):
 
         return urls
 
+    # ------------------------------------------------------------------
+    # Detail extraction
+    # ------------------------------------------------------------------
+
     def _extract_from_detail(self, detail_url: str) -> ExtractedItem | None:
-        # JS render is key for Eventbrite
+        print("[eventbrite] parsing detail:", detail_url)
+
         res = http_get(detail_url, render_js=True)
         html = res.text or ""
         soup = BeautifulSoup(html, "html.parser")
 
         structured = extract_jsonld_event(soup)
 
-        # title
         title = self._get_title_from_jsonld(soup) or self._get_title_from_page(soup)
         if not title:
             print("[eventbrite] skip (no title):", detail_url)
             return None
 
-        # location (best effort)
-        loc_jsonld = self._get_location_from_jsonld(soup)
-        loc_text = self._extract_location_text(soup)
-        location_raw = loc_jsonld or loc_text
+        location_raw = (
+            self._get_location_from_jsonld(soup)
+            or self._extract_location_text(soup)
+        )
 
-        # Skip obvious online events
         if self._is_online_event(soup, location_raw):
-            print("[eventbrite] skip (online):", detail_url, "| loc:", (location_raw or "")[:120])
+            print("[eventbrite] skip (online):", detail_url)
             return None
 
-        # Zurich filter: keep if URL or location signals Zurich.
-        if not self._looks_like_zurich(detail_url, location_raw):
-            print("[eventbrite] skip (not zurich):", detail_url, "| loc:", (location_raw or "")[:120])
-            return None
+        if location_raw:
+            if not self._looks_like_zurich(detail_url, location_raw):
+                print("[eventbrite] skip (not zurich):", detail_url)
+                return None
+        else:
+            if not _ZH_HINT_RE.search(detail_url.lower()):
+                print("[eventbrite] skip (no location + no zurich hint):", detail_url)
+                return None
 
-        # datetime_raw
         if structured and structured.start_iso:
             extraction_method = "jsonld"
             if structured.end_iso:
@@ -121,7 +142,7 @@ class EventbriteAdapter(BaseAdapter):
         image_url = self._extract_image_url(soup)
         description_raw = self._get_description(soup)
 
-        print("[eventbrite] KEEP:", title[:80], "|", detail_url)
+        print("[eventbrite] KEEP:", title[:80])
 
         return ExtractedItem(
             title_raw=title,
@@ -130,7 +151,7 @@ class EventbriteAdapter(BaseAdapter):
             description_raw=description_raw,
             item_url=detail_url,
             extra={
-                "adapter": "eventbrite-zurich",
+                "adapter": "eventbrite",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
                 "image_url": image_url,
@@ -138,40 +159,22 @@ class EventbriteAdapter(BaseAdapter):
             fetched_at=datetime.now(timezone.utc),
         )
 
-    # ----------------------------
-    # Filters / heuristics
-    # ----------------------------
-    def _is_online_event(self, soup: BeautifulSoup, location_raw: str | None) -> bool:
-        loc = (location_raw or "").strip().lower()
-        if loc.startswith("online"):
-            return True
-        txt = soup.get_text(" ", strip=True).lower()
-        return ("online event" in txt) or ("this is an online event" in txt)
+    # ------------------------------------------------------------------
+    # JSON-LD helpers (robust)
+    # ------------------------------------------------------------------
 
-    def _looks_like_zurich(self, url: str, location_raw: str | None) -> bool:
-        u = (url or "").lower()
-        if _ZH_HINT_RE.search(u):
-            return True
+    def _iter_jsonld_nodes(self, data: Any) -> Iterator[dict]:
+        if isinstance(data, dict):
+            if "@graph" in data and isinstance(data["@graph"], list):
+                for n in data["@graph"]:
+                    yield from self._iter_jsonld_nodes(n)
+            yield data
+            for v in data.values():
+                yield from self._iter_jsonld_nodes(v)
+        elif isinstance(data, list):
+            for x in data:
+                yield from self._iter_jsonld_nodes(x)
 
-        t = (location_raw or "").lower()
-        if _ZH_HINT_RE.search(t):
-            return True
-
-        # Zurich-ish zip heuristic (broad but useful)
-        if re.search(r"\b(80|81)\d{2}\b", t):
-            return True
-
-        # Add Goldküste towns as acceptable Zurich-area hits
-        allow = [
-            "küsnacht", "kuesnacht", "zollikon", "thalwil", "horgen",
-            "meilen", "stäfa", "staefa", "uetikon", "männedorf", "maennedorf",
-            "herrliberg", "kilchberg", "rüschlikon", "rueschlikon",
-        ]
-        return any(a in t for a in allow)
-
-    # ----------------------------
-    # JSON-LD helpers
-    # ----------------------------
     def _get_title_from_jsonld(self, soup: BeautifulSoup) -> str | None:
         for script in soup.find_all("script", type="application/ld+json"):
             try:
@@ -179,9 +182,10 @@ class EventbriteAdapter(BaseAdapter):
             except Exception:
                 continue
 
-            nodes = data if isinstance(data, list) else [data]
-            for node in nodes:
-                if isinstance(node, dict) and node.get("@type") == "Event":
+            for node in self._iter_jsonld_nodes(data):
+                t = node.get("@type")
+                types = t if isinstance(t, list) else [t]
+                if "Event" in types:
                     name = node.get("name")
                     if name:
                         return str(name).strip()
@@ -194,9 +198,10 @@ class EventbriteAdapter(BaseAdapter):
             except Exception:
                 continue
 
-            nodes = data if isinstance(data, list) else [data]
-            for node in nodes:
-                if not (isinstance(node, dict) and node.get("@type") == "Event"):
+            for node in self._iter_jsonld_nodes(data):
+                t = node.get("@type")
+                types = t if isinstance(t, list) else [t]
+                if "Event" not in types:
                     continue
 
                 loc = node.get("location")
@@ -230,9 +235,10 @@ class EventbriteAdapter(BaseAdapter):
 
         return None
 
-    # ----------------------------
-    # Page fallbacks
-    # ----------------------------
+    # ------------------------------------------------------------------
+    # Fallback extraction
+    # ------------------------------------------------------------------
+
     def _get_title_from_page(self, soup: BeautifulSoup) -> str | None:
         h1 = soup.find("h1")
         if h1:
@@ -250,7 +256,12 @@ class EventbriteAdapter(BaseAdapter):
         return None
 
     def _extract_datetime_text(self, soup: BeautifulSoup) -> str | None:
-        for selector in [".date-info", "[data-testid='event-date']", "time", ".event-details time"]:
+        for selector in [
+            ".date-info",
+            "[data-testid='event-date']",
+            "time",
+            ".event-details time",
+        ]:
             el = soup.select_one(selector)
             if el:
                 txt = el.get_text(" ", strip=True)
@@ -259,7 +270,11 @@ class EventbriteAdapter(BaseAdapter):
         return None
 
     def _extract_location_text(self, soup: BeautifulSoup) -> str | None:
-        for selector in [".location-info", "[data-testid='event-location']", ".event-details .location"]:
+        for selector in [
+            ".location-info",
+            "[data-testid='event-location']",
+            ".event-details .location",
+        ]:
             el = soup.select_one(selector)
             if el:
                 txt = el.get_text(" ", strip=True)
@@ -292,3 +307,55 @@ class EventbriteAdapter(BaseAdapter):
             return u or None
 
         return None
+
+    # ------------------------------------------------------------------
+    # Filters
+    # ------------------------------------------------------------------
+
+    def _is_online_event(self, soup: BeautifulSoup, location_raw: str | None) -> bool:
+        loc = (location_raw or "").strip().lower()
+        if loc.startswith("online"):
+            return True
+
+        # Check JSON-LD for online attendance mode or VirtualLocation
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.get_text() or "")
+            except Exception:
+                continue
+            for node in self._iter_jsonld_nodes(data):
+                t = node.get("@type")
+                types = t if isinstance(t, list) else [t]
+                if "Event" not in types:
+                    continue
+                mode = node.get("eventAttendanceMode") or ""
+                if "OnlineEventAttendanceMode" in str(mode):
+                    return True
+                loc_node = node.get("location")
+                if isinstance(loc_node, dict) and loc_node.get("@type") == "VirtualLocation":
+                    return True
+                if isinstance(loc_node, list):
+                    for ln in loc_node:
+                        if isinstance(ln, dict) and ln.get("@type") == "VirtualLocation":
+                            return True
+
+        return False
+
+    def _looks_like_zurich(self, url: str, location_raw: str | None) -> bool:
+        u = (url or "").lower()
+        if _ZH_HINT_RE.search(u):
+            return True
+
+        t = (location_raw or "").lower()
+        if _ZH_HINT_RE.search(t):
+            return True
+
+        if re.search(r"\b(80|81)\d{2}\b", t):
+            return True
+
+        allow = [
+            "küsnacht", "kuesnacht", "zollikon", "thalwil", "horgen",
+            "meilen", "stäfa", "staefa", "uetikon", "männedorf", "maennedorf",
+            "herrliberg", "kilchberg", "rüschlikon", "rueschlikon",
+        ]
+        return any(a in t for a in allow)

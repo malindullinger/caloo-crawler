@@ -38,6 +38,12 @@ def main() -> None:
         # 2) Normalize
         n = raw_to_normalized(r, now_utc=now_utc)
         if not n:
+            print(
+                f"[pipeline] NORMALIZE_FAILED source_id={r.source_id}"
+                f" | title={r.title_raw!r}"
+                f" | datetime_raw={r.datetime_raw!r}"
+                f" | item_url={r.item_url}"
+            )
             continue
 
         # 3) Upsert normalized event

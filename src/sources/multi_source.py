@@ -1,62 +1,118 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import List
 
+from ..db.db_sources import DbSourcesLoader
+from ..models import RawEvent
 from .registry import get_adapter
 from .types import SourceConfig, ExtractedItem
-from ..models import RawEvent
 
 
-SOURCES: List[SourceConfig] = [
-    SourceConfig(
-        source_id="maennedorf_portal",
-        adapter="maennedorf_portal",
-        seed_url="https://www.maennedorf.ch/anlaesseaktuelles?datumVon=22.01.2026&datumBis=30.12.2026",
-        timezone="Europe/Zurich",
-        max_items=50,
-    ),
-    SourceConfig(
-        source_id="ref-staefa-hombrechtikon",
-        adapter="church_hub",
-        seed_url="https://www.ref-staefa-hombrechtikon.ch/",
-        timezone="Europe/Zurich",
-        max_items=50,
-    ),
-    SourceConfig(
-        source_id="uetikon_vereinsliste",
-        adapter="vereins_directory",
-        seed_url="https://www.uetikonamsee.ch/vereinsliste",
-        timezone="Europe/Zurich",
-        max_items=200,
-    ),
-    SourceConfig(
-        source_id="kino-wildenmann",
-        adapter="kino_wildenmann",
-        seed_url="https://www.kino-wildenmann.ch/",
-        timezone="Europe/Zurich",
-        max_items=100,
-    ),
-    SourceConfig(
-        source_id="eventbrite-zurich",
-        adapter="eventbrite",
-        seed_url="https://www.eventbrite.ch/d/switzerland--zurich/events/",
-        timezone="Europe/Zurich",
-        max_items=20,
-    ),
-]
+def _hardcoded_sources_fallback() -> List[SourceConfig]:
+    return [
+        SourceConfig(
+            source_id="maennedorf_portal",
+            adapter="maennedorf_portal",
+            seed_url="https://www.maennedorf.ch/anlaesseaktuelles?datumVon=22.01.2026&datumBis=30.12.2026",
+            timezone="Europe/Zurich",
+            max_items=50,
+        ),
+        SourceConfig(
+            source_id="eventbrite_zurich",
+            adapter="eventbrite",
+            seed_url="https://www.eventbrite.com/d/switzerland--zurich/events/",
+            timezone="Europe/Zurich",
+            max_items=50,
+        ),
+        SourceConfig(
+            source_id="elternverein_uetikon",
+            adapter="elternverein_uetikon",
+            seed_url="https://elternverein-uetikon.ch/veranstaltungen",
+            timezone="Europe/Zurich",
+            max_items=50,
+        ),
+    ]
+
+
+def _log_sources(mode: str, sources: List[SourceConfig]) -> None:
+    print(f"[sources] mode={mode} count={len(sources)}")
+    for s in sources:
+        print(
+            f"[sources] - source_id={s.source_id} adapter={s.adapter} "
+            f"max_items={s.max_items} seed_url={s.seed_url}"
+        )
+
+
+def load_sources() -> List[SourceConfig]:
+    """
+    DB-first source loading.
+    Falls back to hardcoded sources if DB is missing/unreachable/empty.
+
+    Toggle:
+      CALOO_SOURCES_FROM_DB=true/false (default true)
+    """
+    use_db = os.getenv("CALOO_SOURCES_FROM_DB", "true").strip().lower() in ("1", "true", "yes", "y")
+    if not use_db:
+        sources = _hardcoded_sources_fallback()
+        _log_sources("HARDCODED (CALOO_SOURCES_FROM_DB=false)", sources)
+        return sources
+
+    try:
+        loader = DbSourcesLoader.from_env()
+        rows = loader.load_enabled_sources()
+
+        if not rows:
+            sources = _hardcoded_sources_fallback()
+            _log_sources("FALLBACK (DB empty / no enabled sources)", sources)
+            return sources
+
+        sources = [
+            SourceConfig(
+                source_id=r.source_id,
+                adapter=r.adapter,
+                seed_url=r.seed_url,
+                max_items=r.max_items,
+                timezone=r.timezone or "Europe/Zurich",
+            )
+            for r in rows
+        ]
+        _log_sources("DB", sources)
+        return sources
+
+    except Exception as e:
+        sources = _hardcoded_sources_fallback()
+        _log_sources(f"FALLBACK (DB load failed: {type(e).__name__}: {e})", sources)
+        return sources
 
 
 def fetch_and_extract() -> List[RawEvent]:
+    """
+    Entry point used by pipeline.py.
+
+    Runs enabled sources sequentially. A single failing source does not crash the full run.
+    """
+    sources = load_sources()
     now = datetime.now(timezone.utc)
     out: List[RawEvent] = []
 
-    for cfg in SOURCES:
-        if not cfg.enabled:
+    for cfg in sources:
+        print(f"[source] start source_id={cfg.source_id} adapter={cfg.adapter} max_items={cfg.max_items}")
+        try:
+            adapter = get_adapter(cfg.adapter)
+        except Exception as e:
+            print(
+                f"[source] ERROR get_adapter failed source_id={cfg.source_id} "
+                f"adapter={cfg.adapter}: {type(e).__name__}: {e}"
+            )
             continue
 
-        adapter = get_adapter(cfg.adapter)
-        items: List[ExtractedItem] = adapter.fetch(cfg)
+        try:
+            items: List[ExtractedItem] = adapter.fetch(cfg)
+        except Exception as e:
+            print(f"[source] ERROR fetch failed source_id={cfg.source_id}: {type(e).__name__}: {e}")
+            continue
 
         # Enrich each item (detail fetch fallback)
         enriched: List[ExtractedItem] = []
@@ -66,12 +122,10 @@ def fetch_and_extract() -> List[RawEvent]:
 
         # Convert to RawEvent
         for idx, it in enumerate(enriched):
-            # 🔎 TEMP DEBUG (limit to first 25 items per source)
             if idx < 25:
                 img = (it.extra or {}).get("image_url")
                 if isinstance(img, str):
                     img = img.strip() or None
-
                 print(
                     f"[DEBUG {cfg.source_id}] image_url:",
                     img,
@@ -95,4 +149,7 @@ def fetch_and_extract() -> List[RawEvent]:
                 )
             )
 
+        print(f"[source] done source_id={cfg.source_id} items={len(enriched)}")
+
+    print(f"[sources] total_raws={len(out)}")
     return out
