@@ -119,9 +119,10 @@ def mark_source_needs_review(
     supabase: Client,
     source_happening_id: str,
 ) -> None:
+    # Phase 3 guard: only v1| rows can be set to needs_review
     supabase.table("source_happenings").update(
         {"status": "needs_review"}
-    ).eq("id", source_happening_id).execute()
+    ).eq("id", source_happening_id).like("dedupe_key", "v1|%").execute()
 
 
 def ignore_open_reviews_for_source_row(

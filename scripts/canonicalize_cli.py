@@ -5,15 +5,33 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from typing import Any, Optional
+
+
+def _load_dotenv_if_available() -> None:
+    """
+    Load .env from the project root if python-dotenv is installed.
+    Safe no-op if python-dotenv is not present.
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        return
+    load_dotenv()
 
 
 def get_supabase_client() -> Any:
     """
     Try to reuse the project's existing Supabase client helper if present.
     Fallback to supabase-py client from env vars.
+
+    Expected env vars (prefer service role for backend scripts):
+      - SUPABASE_URL
+      - SUPABASE_SERVICE_ROLE_KEY  (preferred for crawler/admin scripts)
+        OR SUPABASE_ANON_KEY       (only if RLS/policies permit your read/write)
     """
+    _load_dotenv_if_available()
+
     # 1) Try common internal helpers (adjustable, but safe to attempt)
     candidates = [
         ("src.db.supabase", "get_supabase"),
@@ -31,19 +49,25 @@ def get_supabase_client() -> Any:
 
     # 2) Fallback: environment variables
     url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+    key = (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_ANON_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+    )
 
     if not url or not key:
         raise RuntimeError(
             "Supabase client not found. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY "
-            "(or SUPABASE_ANON_KEY), or add a project helper (e.g., src/db/supabase.py)."
+            "(preferred for backend scripts), or SUPABASE_ANON_KEY if RLS allows it. "
+            "Alternatively provide a project helper (e.g., src/db/supabase.py)."
         )
 
     try:
         from supabase import create_client  # type: ignore
     except Exception as e:
         raise RuntimeError(
-            "supabase-py is not installed in this environment. Install it or provide a project supabase helper."
+            "supabase-py is not installed in this environment. Install it (pip install supabase) "
+            "or provide a project supabase helper."
         ) from e
 
     return create_client(url, key)
@@ -53,20 +77,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Caloo canonicalization CLI (Milestone 2 helper).")
     parser.add_argument("--source-id", default=None, help="Filter to a single source_id (optional).")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of events to sync (optional).")
+
+    # Default: dry-run (safe). Use --write to allow DB writes.
     parser.add_argument(
-        "--dry-run",
+        "--write",
         action="store_true",
-        default=True,
-        help="Dry run (default: true). Use --no-dry-run to write to DB.",
-    )
-    parser.add_argument(
-        "--no-dry-run",
-        action="store_false",
-        dest="dry_run",
-        help="Write to DB (dangerous).",
+        help="Write to DB (dangerous). Default is dry-run.",
     )
 
     args = parser.parse_args(argv)
+    dry_run = not args.write
 
     # Import here so the file can be imported without supabase deps
     from src.canonicalize.sync import sync_to_source_happenings
@@ -76,7 +96,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     result = sync_to_source_happenings(
         supabase=supabase,
         source_id=args.source_id,
-        dry_run=args.dry_run,
+        dry_run=dry_run,
         limit=args.limit,
     )
 
@@ -87,7 +107,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"needs_review:   {result.needs_review}")
     print(f"errors:         {result.errors}")
 
-    # Non-zero exit if hard errors
     return 0 if result.errors == 0 else 2
 
 

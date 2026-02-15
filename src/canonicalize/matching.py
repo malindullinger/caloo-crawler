@@ -6,7 +6,6 @@ No DB access, no crawler imports.
 from __future__ import annotations
 
 import re
-from hashlib import sha256
 from typing import Any, Dict, Optional
 
 CONFIDENCE_THRESHOLD = 0.85
@@ -59,15 +58,26 @@ def jaccard_tokens(a: str, b: str) -> float:
 def compute_fingerprint(source_row: Dict[str, Any]) -> str:
     """
     Deterministic fingerprint for a source_happenings row.
-    Uses start_date_local (DATE, not timestamp) so date-only sources match.
 
-    Expects dict keys: title_raw, start_date_local (str ISO or None), location_raw.
+    Delegates to compute_dedupe_key so the fingerprint used in merge_loop
+    reviews matches the stored dedupe_key exactly.
+
+    Falls back to a minimal hash if dedupe_key cannot be computed (e.g.
+    during dry-run scoring when identifiers are absent).
     """
-    t = normalize_title(source_row.get("title_raw"))
-    d = source_row.get("start_date_local") or ""
-    v = normalize_venue(source_row.get("location_raw"))
-    base = "|".join(part for part in (t, d, v) if part)
-    return sha256(base.encode("utf-8")).hexdigest()[:32]
+    from .dedupe_key import compute_dedupe_key
+
+    try:
+        return compute_dedupe_key(
+            source_id=source_row.get("source_id") or "",
+            title=source_row.get("title_raw"),
+            start_date_local=source_row.get("start_date_local"),
+            location=source_row.get("location_raw"),
+            item_url=source_row.get("item_url"),
+            external_id=source_row.get("external_id"),
+        )
+    except ValueError:
+        return ""
 
 
 # ---------------------------------------------------------------------------

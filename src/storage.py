@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import hashlib
 import os
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Optional
 
 from supabase import Client, create_client
 
+from .canonicalize.dedupe_key import compute_dedupe_key
 from .models import RawEvent, NormalizedEvent
+
+# ---- Phase 3: Dedupe metrics ----
+_DEDUPE_CONTENT = 0
+_DEDUPE_FALLBACK = 0
+_DEDUPE_ERROR = 0
 
 
 # -----------------------------------------------------------------------------
@@ -55,10 +60,6 @@ def get_supabase() -> Client:
 # Small utilities
 # -----------------------------------------------------------------------------
 
-def _sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
 def _extract_image_url(extra: Mapping[str, Any] | None) -> Optional[str]:
     if not extra:
         return None
@@ -67,29 +68,6 @@ def _extract_image_url(extra: Mapping[str, Any] | None) -> Optional[str]:
         v = v.strip()
         return v or None
     return None
-
-
-def _derive_dedupe_key(
-    *,
-    source_id: str,
-    item_url: Optional[str],
-    external_id: Optional[str],
-) -> str:
-    """
-    Must ALWAYS return a stable, non-null key.
-
-    Strategy:
-      1) If external_id exists -> use it (stable for now)
-      2) Else use item_url
-      3) Else raise hard error (no time-based fallback allowed)
-    """
-    if external_id:
-        return _sha256(f"{source_id}|ext|{external_id}")
-    if item_url:
-        return _sha256(f"{source_id}|url|{item_url}")
-    raise ValueError(
-        f"Cannot derive dedupe_key: missing both external_id and item_url for source {source_id}"
-    )
 
 
 def _dt_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -156,29 +134,39 @@ def enqueue_source_happening(ev: NormalizedEvent) -> None:
     item_url = (ev.canonical_url or "").strip() or None
     external_id = (ev.external_id or "").strip() or None
 
+    # Local dates (required for matching + queue + dedupe_key)
+    start_date_local = ev.start_at.date() if ev.start_at else None
+    end_date_local = ev.end_at.date() if ev.end_at else start_date_local
+
+    location_raw = getattr(ev, "location_name", None) or getattr(ev, "location_address", None)
+
     try:
-        dedupe_key = _derive_dedupe_key(
+        dedupe_key = compute_dedupe_key(
             source_id=ev.source_id,
+            title=ev.title,
+            start_date_local=_date_iso(start_date_local),
+            location=location_raw,
             item_url=item_url,
             external_id=external_id,
         )
+
+        global _DEDUPE_CONTENT, _DEDUPE_FALLBACK
+
+        # Content-based path requires title + date
+        if ev.title and start_date_local:
+            _DEDUPE_CONTENT += 1
+        else:
+            _DEDUPE_FALLBACK += 1
+
     except ValueError:
+        global _DEDUPE_ERROR
+        _DEDUPE_ERROR += 1
+
         print(
             f"[storage] SKIP item: cannot derive dedupe_key"
-            f" | source_id={ev.source_id} external_id={external_id} item_url={item_url}"
+            f" | source_id={ev.source_id}"
         )
         return
-
-    if not dedupe_key:
-        print(
-            f"[storage] SKIP item: empty dedupe_key"
-            f" | source_id={ev.source_id} external_id={external_id} item_url={item_url}"
-        )
-        return
-
-    # Local dates (required for matching + queue)
-    start_date_local = ev.start_at.date() if ev.start_at else None
-    end_date_local = ev.end_at.date() if ev.end_at else start_date_local
 
     payload: dict[str, Any] = {
         "source_id": ev.source_id,
@@ -187,7 +175,7 @@ def enqueue_source_happening(ev: NormalizedEvent) -> None:
         "external_id": external_id,
         "title_raw": ev.title,
         "datetime_raw": None,
-        "location_raw": getattr(ev, "location_name", None) or getattr(ev, "location_address", None),
+        "location_raw": location_raw,
         "description_raw": ev.description,
         "date_precision": ev.date_precision,
         "start_at": _dt_iso(ev.start_at),
@@ -247,21 +235,17 @@ def upsert_source_happening_row(payload: dict[str, Any]) -> bool:
     item_url = (payload.get("item_url") or "").strip() or None
 
     try:
-        dedupe_key = _derive_dedupe_key(
+        dedupe_key = compute_dedupe_key(
             source_id=source_id,
+            title=payload.get("title_raw"),
+            start_date_local=payload.get("start_date_local"),
+            location=payload.get("location_raw"),
             item_url=item_url,
             external_id=external_id,
         )
     except ValueError:
         print(
             f"[storage] SKIP item: cannot derive dedupe_key"
-            f" | source_id={source_id} external_id={external_id} item_url={item_url}"
-        )
-        return False
-
-    if not dedupe_key:
-        print(
-            f"[storage] SKIP item: empty dedupe_key"
             f" | source_id={source_id} external_id={external_id} item_url={item_url}"
         )
         return False

@@ -5,6 +5,7 @@ import argparse
 import os
 import random
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -24,6 +25,16 @@ from src.canonicalize.reviews_supabase import (
     mark_source_needs_review,
     write_ambiguous_match_review,
 )
+from src.db.canonical_field_history import (
+    diff_happening_fields,
+    log_field_changes,
+)
+from src.db.confidence_telemetry import ConfidenceTelemetry
+from src.db.merge_run_stats import (
+    MergeRunCounters,
+    create_merge_run,
+    finish_merge_run,
+)
 
 # ---------------------------------------------------------------------------
 # Constants & helpers
@@ -41,6 +52,10 @@ STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_PROCESSED = "processed"
 STATUS_PROCESSING = "processing"
 STATUS_IGNORED = "ignored"
+
+# Only v1 dedupe_key rows are processable (Phase 3 contract).
+# Legacy rows (URL-based keys) are permanently quarantined.
+DEDUPE_KEY_PREFIX = "v1|"
 
 
 def execute_with_retry(rb, *, tries: int = 6, base_sleep: float = 0.5):
@@ -123,6 +138,7 @@ class MatchDecision:
     kind: str  # "merge" | "create" | "review"
     best_happening_id: str | None = None
     candidates: list[Candidate] | None = None
+    top_confidence: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +151,13 @@ def fetch_queued_source_happenings(
     include_needs_review: bool = False,
 ) -> list[dict[str, Any]]:
     """
-    Default queue = STATUS_QUEUED.
-    Optionally include STATUS_NEEDS_REVIEW.
+    Select processable source_happenings.
 
-    NOTE: We also explicitly exclude STATUS_PROCESSING so we can "claim" rows
-    and avoid reprocessing loops.
+    HARD GUARDS (Phase 3):
+      1. dedupe_key LIKE 'v1|%'  — only content-based v1 rows
+      2. status IN (queued [, needs_review])
+
+    Legacy rows (URL-based keys) are permanently excluded regardless of status.
     """
     statuses = [STATUS_QUEUED]
     if include_needs_review:
@@ -148,6 +166,7 @@ def fetch_queued_source_happenings(
     resp = execute_with_retry(
         supabase.table("source_happenings")
         .select("*")
+        .like("dedupe_key", "v1|%")
         .in_("status", statuses)
         .order("created_at", desc=False)
         .limit(limit)
@@ -330,7 +349,9 @@ def decide_match(
     second = float(scored[1].confidence) if len(scored) > 1 else None
 
     if top < CONFIDENCE_THRESHOLD:
-        return MatchDecision(kind="review", candidates=scored[:10])
+        # Low confidence = no match. Create a new canonical happening.
+        # Only near-ties above threshold are truly "ambiguous".
+        return MatchDecision(kind="create", top_confidence=top)
 
     perfect = [
         c
@@ -338,12 +359,12 @@ def decide_match(
         if abs(float(c.confidence) - PERFECT_CONFIDENCE) <= PERFECT_TIE_EPS
     ]
     if len(perfect) >= 2:
-        return MatchDecision(kind="review", candidates=scored[:10])
+        return MatchDecision(kind="review", candidates=scored[:10], top_confidence=top)
 
     if second is not None and (top - second) < NEAR_TIE_DELTA:
-        return MatchDecision(kind="review", candidates=scored[:10])
+        return MatchDecision(kind="review", candidates=scored[:10], top_confidence=top)
 
-    return MatchDecision(kind="merge", best_happening_id=scored[0].happening_id)
+    return MatchDecision(kind="merge", best_happening_id=scored[0].happening_id, top_confidence=top)
 
 
 # ---------------------------------------------------------------------------
@@ -387,17 +408,23 @@ def create_happening_schedule_occurrence(
     ).data[0]
     offering_id = offering["id"]
 
-    occurrence_payload = {
-        "offering_id": offering_id,
-        "start_at": source_row.get("start_at"),
-        "end_at": source_row.get("end_at"),
-        "status": "scheduled",
-    }
-    occurrence_payload = {k: v for k, v in occurrence_payload.items() if v is not None}
+    # Only create an occurrence when we have a real start_at timestamp.
+    # Date-only items (date_precision='date', start_at=NULL) must NOT
+    # produce occurrence rows — the DB enforces NOT NULL on start_at
+    # and the time contract forbids inventing midnight placeholders.
+    start_at = source_row.get("start_at")
+    if start_at is not None:
+        occurrence_payload = {
+            "offering_id": offering_id,
+            "start_at": start_at,
+            "end_at": source_row.get("end_at"),
+            "status": "scheduled",
+        }
+        occurrence_payload = {k: v for k, v in occurrence_payload.items() if v is not None}
 
-    execute_with_retry(
-        supabase.table("occurrence").insert(occurrence_payload)
-    )
+        execute_with_retry(
+            supabase.table("occurrence").insert(occurrence_payload)
+        )
 
     return str(happening_id)
 
@@ -405,6 +432,41 @@ def create_happening_schedule_occurrence(
 # ---------------------------------------------------------------------------
 # Provenance
 # ---------------------------------------------------------------------------
+
+def update_happening_on_merge(
+    *,
+    supabase: Client,
+    happening_id: str,
+    source_row: Mapping[str, Any],
+) -> tuple[int, int]:
+    """
+    Compare tracked fields between current happening and source row.
+    If any differ (and source is non-null), update the happening and
+    log the old→new transition to canonical_field_history.
+
+    Returns: (field_updates_count, history_rows_inserted)
+    """
+    current = execute_with_retry(
+        supabase.table("happening").select("*").eq("id", happening_id)
+    ).data
+    if not current:
+        return (0, 0)
+
+    changes = diff_happening_fields(current[0], source_row)
+    if not changes:
+        return (0, 0)
+
+    update_payload = {c.field_name: c.new_value for c in changes}
+    execute_with_retry(
+        supabase.table("happening").update(update_payload).eq("id", happening_id)
+    )
+
+    history_inserts = log_field_changes(
+        supabase, happening_id, str(source_row["id"]), changes,
+    )
+
+    return (len(changes), history_inserts)
+
 
 def link_happening_source(
     *,
@@ -453,6 +515,8 @@ def mark_source_processing_failed(
     """
     If a row was claimed as PROCESSING but something crashes, we want it to
     be visible again. Put it back to NEEDS_REVIEW with an error message.
+
+    Phase 3 guard: only v1| rows can be requeued.
     """
     execute_with_retry(
         supabase.table("source_happenings")
@@ -464,6 +528,7 @@ def mark_source_processing_failed(
             }
         )
         .eq("id", source_happening_id)
+        .like("dedupe_key", "v1|%")
     )
 
 
@@ -479,10 +544,11 @@ def run_merge_loop(
     code_version: str | None = None,
     environment: str | None = None,
     include_needs_review: bool = False,
+    persist_run_stats: bool = True,
 ) -> dict[str, int]:
     run_id = str(uuid4())
 
-    counts = {
+    counts: dict[str, int] = {
         "queued": 0,   # total fetched across loops
         "merged": 0,
         "created": 0,
@@ -490,85 +556,69 @@ def run_merge_loop(
         "skipped": 0,
         "claimed": 0,
         "errors": 0,
+        "canonical_updates": 0,
+        "history_rows": 0,
     }
 
-    while True:
-        rows = fetch_queued_source_happenings(
-            supabase,
-            limit=batch_size,
-            include_needs_review=include_needs_review,
-        )
+    # Per-source breakdown for observability (Phase 7)
+    source_breakdown: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"created": 0, "merged": 0, "review": 0, "field_updates": 0, "errors": 0}
+    )
+    stage_timings: dict[str, int] = {}
+    t_start = time.monotonic()
 
-        print(f"[merge_loop] fetched_batch={len(rows)} include_needs_review={include_needs_review}")
+    # Confidence telemetry (Phase 9)
+    telemetry = ConfidenceTelemetry()
 
-        if not rows:
-            break
-
-        counts["queued"] += len(rows)
-
-        # ✅ Claim rows to avoid infinite refetch loops
+    # --- Run stats: create row at start ---
+    stats_run_id: str | None = None
+    if persist_run_stats:
         try:
-            claim_source_happenings(supabase, rows, dry_run=dry_run)
-            counts["claimed"] += len(rows) if not dry_run else 0
+            stats_run_id = create_merge_run(supabase)
         except Exception as e:
-            # If claiming fails, bail out to avoid spinning forever.
-            print(f"[merge_loop] ERROR claiming batch: {repr(e)}")
-            counts["errors"] += 1
-            break
+            print(f"[merge_loop] WARNING: failed to create merge_run_stats row: {e!r}")
 
-        for source_row in rows:
-            source_id = str(source_row.get("id") or "")
+    try:
+        while True:
+            rows = fetch_queued_source_happenings(
+                supabase,
+                limit=batch_size,
+                include_needs_review=include_needs_review,
+            )
+
+            print(f"[merge_loop] fetched_batch={len(rows)} include_needs_review={include_needs_review}")
+
+            if not rows:
+                break
+
+            counts["queued"] += len(rows)
+
+            # Claim rows to avoid infinite refetch loops
             try:
-                fingerprint = compute_fingerprint(source_row)
-                candidate_bundles = fetch_candidate_bundles(supabase, source_row)
-                decision = decide_match(source_row, candidate_bundles)
+                claim_source_happenings(supabase, rows, dry_run=dry_run)
+                counts["claimed"] += len(rows) if not dry_run else 0
+            except Exception as e:
+                # If claiming fails, bail out to avoid spinning forever.
+                print(f"[merge_loop] ERROR claiming batch: {repr(e)}")
+                counts["errors"] += 1
+                break
 
-                if decision.kind == "review":
-                    counts["review"] += 1
-                    if not dry_run:
-                        mark_source_needs_review(
-                            supabase=supabase,
-                            source_happening_id=source_id,
-                        )
-                        write_ambiguous_match_review(
-                            supabase=supabase,
-                            run_id=run_id,
-                            source_row=source_row,
-                            fingerprint=fingerprint,
-                            candidates=decision.candidates or [],
-                            threshold=CONFIDENCE_THRESHOLD,
-                            code_version=code_version,
-                            environment=environment,
-                        )
-                    continue
+            for source_row in rows:
+                source_id = str(source_row.get("id") or "")
+                src_name = str(source_row.get("source_id") or "unknown")
+                try:
+                    fingerprint = compute_fingerprint(source_row)
+                    candidate_bundles = fetch_candidate_bundles(supabase, source_row)
+                    decision = decide_match(source_row, candidate_bundles)
 
-                if decision.kind == "create":
-                    counts["created"] += 1
-                    if not dry_run:
-                        happening_id = create_happening_schedule_occurrence(
-                            supabase=supabase,
-                            source_row=source_row,
-                        )
-                        link_happening_source(
-                            supabase=supabase,
-                            happening_id=happening_id,
-                            source_row=source_row,
-                            is_primary=True,
-                        )
-                        mark_source_processed(
-                            supabase=supabase,
-                            source_happening_id=source_id,
-                        )
-                        ignore_open_reviews_for_source_row(
-                            supabase=supabase,
-                            source_happening_id=source_id,
-                        )
-                    continue
+                    # Phase 9: record confidence telemetry (passive, no decision changes)
+                    if decision.top_confidence is not None:
+                        telemetry.add(src_name, decision.top_confidence)
 
-                if decision.kind == "merge":
-                    counts["merged"] += 1
-                    if not dry_run:
-                        if not decision.best_happening_id:
+                    if decision.kind == "review":
+                        counts["review"] += 1
+                        source_breakdown[src_name]["review"] += 1
+                        if not dry_run:
                             mark_source_needs_review(
                                 supabase=supabase,
                                 source_happening_id=source_id,
@@ -583,39 +633,124 @@ def run_merge_loop(
                                 code_version=code_version,
                                 environment=environment,
                             )
-                            continue
+                        continue
 
-                        link_happening_source(
-                            supabase=supabase,
-                            happening_id=decision.best_happening_id,
-                            source_row=source_row,
-                        )
-                        mark_source_processed(
-                            supabase=supabase,
-                            source_happening_id=source_id,
-                        )
-                        ignore_open_reviews_for_source_row(
-                            supabase=supabase,
-                            source_happening_id=source_id,
-                        )
+                    if decision.kind == "create":
+                        counts["created"] += 1
+                        source_breakdown[src_name]["created"] += 1
+                        if not dry_run:
+                            happening_id = create_happening_schedule_occurrence(
+                                supabase=supabase,
+                                source_row=source_row,
+                            )
+                            link_happening_source(
+                                supabase=supabase,
+                                happening_id=happening_id,
+                                source_row=source_row,
+                                is_primary=True,
+                            )
+                            mark_source_processed(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                            ignore_open_reviews_for_source_row(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                        continue
+
+                    if decision.kind == "merge":
+                        counts["merged"] += 1
+                        source_breakdown[src_name]["merged"] += 1
+                        if not dry_run:
+                            if not decision.best_happening_id:
+                                mark_source_needs_review(
+                                    supabase=supabase,
+                                    source_happening_id=source_id,
+                                )
+                                write_ambiguous_match_review(
+                                    supabase=supabase,
+                                    run_id=run_id,
+                                    source_row=source_row,
+                                    fingerprint=fingerprint,
+                                    candidates=decision.candidates or [],
+                                    threshold=CONFIDENCE_THRESHOLD,
+                                    code_version=code_version,
+                                    environment=environment,
+                                )
+                                continue
+
+                            link_happening_source(
+                                supabase=supabase,
+                                happening_id=decision.best_happening_id,
+                                source_row=source_row,
+                            )
+                            field_updates, history_inserts = update_happening_on_merge(
+                                supabase=supabase,
+                                happening_id=decision.best_happening_id,
+                                source_row=source_row,
+                            )
+                            counts["canonical_updates"] += field_updates
+                            counts["history_rows"] += history_inserts
+                            source_breakdown[src_name]["field_updates"] += field_updates
+                            mark_source_processed(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                            ignore_open_reviews_for_source_row(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                        continue
+
+                    counts["skipped"] += 1
+
+                except Exception as e:
+                    counts["errors"] += 1
+                    source_breakdown[src_name]["errors"] += 1
+                    print(f"[merge_loop] ERROR row id={source_id}: {repr(e)}")
+                    if not dry_run and source_id:
+                        # Put row back to needs_review so it remains visible.
+                        try:
+                            mark_source_processing_failed(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                                error_message=repr(e),
+                            )
+                        except Exception as e2:
+                            print(f"[merge_loop] ERROR while marking row needs_review: {repr(e2)}")
                     continue
 
-                counts["skipped"] += 1
+        stage_timings["total_processing_ms"] = int(
+            (time.monotonic() - t_start) * 1000
+        )
 
+    finally:
+        # --- Run stats: update row at end (always, even on error) ---
+        if persist_run_stats and stats_run_id:
+            try:
+                finish_merge_run(
+                    supabase,
+                    stats_run_id,
+                    MergeRunCounters(
+                        source_rows_processed=counts["queued"],
+                        canonical_created=counts["created"],
+                        canonical_merged=counts["merged"],
+                        canonical_review=counts["review"],
+                        errors=counts["errors"],
+                        canonical_updates_count=counts["canonical_updates"],
+                        history_rows_created=counts["history_rows"],
+                    ),
+                    source_breakdown=dict(source_breakdown) if source_breakdown else None,
+                    stage_timings_ms=stage_timings if stage_timings else None,
+                    confidence_min=telemetry.global_stats.min,
+                    confidence_avg=telemetry.global_stats.avg,
+                    confidence_max=telemetry.global_stats.max,
+                    confidence_histogram=telemetry.global_hist,
+                    source_confidence=telemetry.as_source_json(),
+                )
             except Exception as e:
-                counts["errors"] += 1
-                print(f"[merge_loop] ERROR row id={source_id}: {repr(e)}")
-                if not dry_run and source_id:
-                    # Put row back to needs_review so it remains visible.
-                    try:
-                        mark_source_processing_failed(
-                            supabase=supabase,
-                            source_happening_id=source_id,
-                            error_message=repr(e),
-                        )
-                    except Exception as e2:
-                        print(f"[merge_loop] ERROR while marking row needs_review: {repr(e2)}")
-                continue
+                print(f"[merge_loop] WARNING: failed to finish merge_run_stats row: {e!r}")
 
     return counts
 

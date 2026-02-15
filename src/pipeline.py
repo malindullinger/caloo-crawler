@@ -67,6 +67,14 @@ def main() -> None:
         print("Sample normalized event written:")
         print(normalized[0].model_dump())
 
+    from .storage import _DEDUPE_CONTENT, _DEDUPE_FALLBACK, _DEDUPE_ERROR
+
+    print(
+        f"[dedupe_key] content_based={_DEDUPE_CONTENT} "
+        f"fallback={_DEDUPE_FALLBACK} "
+        f"error={_DEDUPE_ERROR}"
+    )
+
 
 if __name__ == "__main__":
     main()
