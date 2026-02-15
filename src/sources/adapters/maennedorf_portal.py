@@ -4,7 +4,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -64,12 +64,47 @@ def _is_non_event_target_url(url: str) -> bool:
     return "/sitzung/" in path or "/abstimmungen/" in path
 
 
+def _diagnose_html_markers(html: str) -> Dict[str, object]:
+    """Check for event-related structural markers in HTML. Diagnostic only."""
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    has_lead = soup.select_one(".icms-lead-container") is not None
+
+    h1_nodes = soup.select("h1")
+    h1_texts = [h.get_text(strip=True) for h in h1_nodes if h.get_text(strip=True)]
+    h1_non_junk = [t for t in h1_texts if not _is_junk_title(t)]
+
+    has_jsonld = False
+    for script in soup.select('script[type="application/ld+json"]'):
+        txt = script.get_text(strip=True)
+        if '"Event"' in txt or '"@type":"Event"' in txt:
+            has_jsonld = True
+            break
+
+    has_time_el = soup.select_one("time[datetime]") is not None
+
+    has_year_text = bool(re.search(r"\b20\d{2}\b", html[:50000])) if html else False
+
+    title_tag = soup.title.get_text(strip=True) if soup.title else ""
+
+    return {
+        "has_lead": has_lead,
+        "h1_count": len(h1_texts),
+        "h1_non_junk": h1_non_junk[:3],
+        "has_jsonld_event": has_jsonld,
+        "has_time_el": has_time_el,
+        "has_year_text": has_year_text,
+        "title_tag": title_tag[:80],
+    }
+
+
 @dataclass(frozen=True)
 class _DetailResult:
     item: Optional[ExtractedItem]
     stats_delta: Dict[str, int]
     used_js: bool
     fetch_seconds: float
+    diag: Dict[str, object] = field(default_factory=dict)
 
 
 class MaennedorfPortalAdapter(BaseAdapter):
@@ -146,6 +181,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
         }
 
         items: List[ExtractedItem] = []
+        fallback_diags: List[Dict[str, object]] = []
 
         t_det0 = time.perf_counter()
         total_fetch_seconds = 0.0
@@ -160,6 +196,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
                     total_fetch_seconds += r.fetch_seconds
                     if r.used_js:
                         stats["js_fallback_used"] += 1
+                        fallback_diags.append(r.diag)
                     for k, v in r.stats_delta.items():
                         stats[k] = stats.get(k, 0) + v
                     if r.item:
@@ -171,7 +208,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
 
         t_det1 = time.perf_counter()
 
-        # Note: items list is in completion order; that’s fine.
+        # Note: items list is in completion order; that's fine.
         # If you ever need stable ordering for debugging, sort by item_url or title here.
 
         print("MaennedorfPortalAdapter: items built:", len(items))
@@ -195,6 +232,25 @@ class MaennedorfPortalAdapter(BaseAdapter):
             f" avg_detail_s={avg_detail_s:.2f}"
             f" avg_fetch_s={avg_fetch_s:.2f}"
         )
+
+        # ---- JS fallback diagnostic summary ----
+        if fallback_diags:
+            print(f"\n[maennedorf][diag] === JS FALLBACK CASES: {len(fallback_diags)} ===")
+            for i, d in enumerate(sorted(fallback_diags, key=lambda x: str(x.get("url", "")))):
+                print(
+                    f"[maennedorf][diag] [{i+1}/{len(fallback_diags)}]"
+                    f" url={d.get('url')}"
+                    f"\n  final_url_nojs={d.get('final_url_nojs')}"
+                    f"\n  html_len_nojs={d.get('html_len_nojs')}"
+                    f"\n  nojs_extraction_ok={d.get('nojs_extraction_ok')}"
+                    f"\n  nojs_skip_reason={d.get('nojs_skip_reason')}"
+                    f"\n  markers_nojs={d.get('markers_nojs')}"
+                    f"\n  final_url_js={d.get('final_url_js')}"
+                    f"\n  html_len_js={d.get('html_len_js')}"
+                    f"\n  js_extraction_ok={d.get('js_extraction_ok')}"
+                    f"\n  markers_js={d.get('markers_js')}"
+                )
+            print("[maennedorf][diag] === END JS FALLBACK CASES ===\n")
 
         return items
 
@@ -226,9 +282,20 @@ class MaennedorfPortalAdapter(BaseAdapter):
         if delta1.get("skip_sitzung", 0) > 0:
             return _DetailResult(item=None, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
 
+        # Skip pages without .icms-lead-container — non-event pages where JS cannot help.
+        # All real event pages on this platform have this container; municipal pages
+        # (Abstimmungen, Gemeindeversammlungen) do not, and JS does not change that.
+        if "icms-lead-container" not in html1:
+            delta1["skip_non_event_target_before_js"] = delta1.get("skip_non_event_target_before_js", 0) + 1
+            return _DetailResult(item=None, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
+
         # Optional JS fallback if extraction failed
         if not allow_js_fallback:
             return _DetailResult(item=None, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
+
+        # Diagnose non-JS HTML before doing JS fallback
+        nojs_markers = _diagnose_html_markers(html1)
+        nojs_skip_reason = next((k for k, v in delta1.items() if v > 0), "unknown")
 
         t2 = time.perf_counter()
         res2 = http_get(detail_url, render_js=True)
@@ -237,8 +304,24 @@ class MaennedorfPortalAdapter(BaseAdapter):
         item2, delta2 = self._extract_from_detail_html(cfg, detail_url, final_url2, html2)
         t3 = time.perf_counter()
 
-        # For stats, use the JS attempt outcome (it’s the “real” attempt)
-        return _DetailResult(item=item2, stats_delta=delta2, used_js=True, fetch_seconds=(t3 - t2) + (t1 - t0))
+        # Diagnose JS HTML
+        js_markers = _diagnose_html_markers(html2)
+
+        diag = {
+            "url": detail_url,
+            "final_url_nojs": final_url1,
+            "html_len_nojs": len(html1),
+            "nojs_extraction_ok": False,
+            "nojs_skip_reason": nojs_skip_reason,
+            "markers_nojs": nojs_markers,
+            "final_url_js": final_url2,
+            "html_len_js": len(html2),
+            "js_extraction_ok": item2 is not None,
+            "markers_js": js_markers,
+        }
+
+        # For stats, use the JS attempt outcome (it's the "real" attempt)
+        return _DetailResult(item=item2, stats_delta=delta2, used_js=True, fetch_seconds=(t3 - t2) + (t1 - t0), diag=diag)
 
     def _extract_from_detail_html(
         self,
