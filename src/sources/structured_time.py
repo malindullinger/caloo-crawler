@@ -57,17 +57,30 @@ def extract_jsonld_event(soup: BeautifulSoup) -> StructuredTime | None:
     return None
 
 
-def _is_event_type(t) -> bool:
-    """Check if @type indicates an Event.
-
-    Handles both string and list formats:
-    - "@type": "Event"
-    - "@type": ["Event", "Thing"]
+def _is_event_type(t: object) -> bool:
     """
+    Return True if a JSON-LD @type indicates a Schema.org Event (or subtype).
+
+    Eventbrite commonly uses Event subtypes like:
+    - SocialEvent
+    - EducationEvent
+    - BusinessEvent
+
+    We treat any string type that endswith("Event") as an Event-family type.
+    This is intentionally narrower than `"Event" in t` to reduce false positives.
+    """
+    if not t:
+        return False
+
     if isinstance(t, str):
-        return t == "Event"
+        return t == "Event" or t.endswith("Event")
+
     if isinstance(t, list):
-        return "Event" in t
+        for x in t:
+            if isinstance(x, str) and (x == "Event" or x.endswith("Event")):
+                return True
+        return False
+
     return False
 
 
