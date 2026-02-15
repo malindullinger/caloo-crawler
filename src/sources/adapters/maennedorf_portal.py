@@ -55,6 +55,15 @@ def _is_junk_title(title: str) -> bool:
     return t in ("kopfzeile", "fusszeile") or t.startswith("kopfzeile") or t.startswith("fusszeile")
 
 
+def _is_non_event_target_url(url: str) -> bool:
+    """Return True if URL path indicates a non-event page (e.g. council sessions, votes)."""
+    try:
+        path = urlparse(url).path or ""
+    except Exception:
+        return False
+    return "/sitzung/" in path or "/abstimmungen/" in path
+
+
 @dataclass(frozen=True)
 class _DetailResult:
     item: Optional[ExtractedItem]
@@ -131,6 +140,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
             "skip_junk_title": 0,
             "skip_no_datetime": 0,
             "skip_sitzung": 0,
+            "skip_non_event_target_before_js": 0,
             "detail_parse_failed": 0,
             "js_fallback_used": 0,
         }
@@ -206,6 +216,11 @@ class MaennedorfPortalAdapter(BaseAdapter):
 
         if item1:
             return _DetailResult(item=item1, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
+
+        # Skip non-event redirects early — no JS fallback needed
+        if _is_non_event_target_url(final_url1):
+            delta1["skip_non_event_target_before_js"] = delta1.get("skip_non_event_target_before_js", 0) + 1
+            return _DetailResult(item=None, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
 
         # If it was a sitzung skip, don't retry with JS.
         if delta1.get("skip_sitzung", 0) > 0:
