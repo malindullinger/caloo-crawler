@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
-from typing import List, Iterator, Any
-from urllib.parse import urljoin
+from typing import Dict, List, Iterator, Any
+from urllib.parse import urljoin, urlparse, parse_qs, unquote
 
 from bs4 import BeautifulSoup
 
@@ -22,12 +23,79 @@ _EVENT_PATH_RE = re.compile(r"/e/", re.IGNORECASE)
 _EVENT_ID_RE = re.compile(r"-(\d{6,})", re.IGNORECASE)
 _ZH_HINT_RE = re.compile(r"(zurich|zürich|zuerich)", re.IGNORECASE)
 
+# Minimum listing URLs before we consider the non-JS listing a failure
+_LISTING_MIN_URLS = 3
+
+
+def resolve_eventbrite_image_url(raw_url: str | None, page_url: str | None = None) -> str | None:
+    """
+    Resolve Eventbrite image URLs to canonical absolute CDN URLs.
+
+    Eventbrite returns relative paths like:
+      /e/_next/image?url=https%3A%2F%2Fimg.evbuc.com%2Fhttps%253A%252F%252Fcdn.evbuc.com%252Fimages%252F...&w=940&q=75
+
+    Strategy:
+    1. If URL contains '_next/image' with a 'url' query param, extract and double-decode it
+       to get the underlying CDN URL (https://cdn.evbuc.com/images/...).
+    2. If URL starts with '/', make it absolute using page_url domain.
+    3. Otherwise return as-is.
+    """
+    if not raw_url:
+        return None
+
+    raw_url = raw_url.strip()
+    if not raw_url:
+        return None
+
+    # Check for _next/image proxy pattern
+    if "_next/image" in raw_url:
+        # Make absolute for urlparse if needed
+        abs_url = raw_url
+        if abs_url.startswith("/"):
+            domain = "https://www.eventbrite.com"
+            if page_url:
+                parsed = urlparse(page_url)
+                domain = f"{parsed.scheme}://{parsed.netloc}"
+            abs_url = domain + abs_url
+
+        try:
+            parsed = urlparse(abs_url)
+            qs = parse_qs(parsed.query)
+            url_param = qs.get("url", [None])[0]
+            if url_param:
+                # Double-decode: first decode from query string, then the inner encoding
+                decoded = unquote(unquote(url_param))
+                if decoded.startswith("http"):
+                    return decoded
+        except Exception:
+            pass
+
+        # Fallback: return the absolute _next/image URL
+        if raw_url.startswith("/"):
+            domain = "https://www.eventbrite.com"
+            if page_url:
+                p = urlparse(page_url)
+                domain = f"{p.scheme}://{p.netloc}"
+            return domain + raw_url
+        return raw_url
+
+    # Make relative URLs absolute
+    if raw_url.startswith("/"):
+        domain = "https://www.eventbrite.com"
+        if page_url:
+            p = urlparse(page_url)
+            domain = f"{p.scheme}://{p.netloc}"
+        return domain + raw_url
+
+    return raw_url
+
 
 class EventbriteAdapter(BaseAdapter):
     """
     Eventbrite adapter using JSON-LD for structured datetime extraction.
 
-    JS rendering is REQUIRED for both listing and detail pages.
+    Performance: non-JS first for both listing and detail pages;
+    JS fallback only when extraction fails.
     """
 
     # ------------------------------------------------------------------
@@ -35,29 +103,81 @@ class EventbriteAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
-        print("[eventbrite] fetching listing:", cfg.seed_url)
+        t0 = time.perf_counter()
 
-        res = http_get(cfg.seed_url, render_js=True)
+        stats: Dict[str, int] = {
+            "ok": 0,
+            "skip_no_title": 0,
+            "skip_online": 0,
+            "skip_not_zurich": 0,
+            "skip_no_datetime": 0,
+            "detail_parse_failed": 0,
+            "listing_js_fallback_used": 0,
+            "detail_nonjs_ok": 0,
+            "detail_js_fallback_used": 0,
+        }
+
+        # --- Listing: try non-JS first ---
+        t_list0 = time.perf_counter()
+        print("[eventbrite] fetching listing (non-JS):", cfg.seed_url)
+        res = http_get(cfg.seed_url, render_js=False)
         html = res.text or ""
         soup = BeautifulSoup(html, "html.parser")
 
         detail_urls = self._extract_event_urls(soup, cfg.seed_url)
-        print(f"[eventbrite] listing URLs found: {len(detail_urls)}")
+        print(f"[eventbrite] listing URLs found (non-JS): {len(detail_urls)}")
+
+        if len(detail_urls) < _LISTING_MIN_URLS:
+            print(f"[eventbrite] non-JS listing yielded <{_LISTING_MIN_URLS} URLs, retrying with JS")
+            stats["listing_js_fallback_used"] = 1
+            res = http_get(cfg.seed_url, render_js=True)
+            html = res.text or ""
+            soup = BeautifulSoup(html, "html.parser")
+            detail_urls = self._extract_event_urls(soup, cfg.seed_url)
+            print(f"[eventbrite] listing URLs found (JS): {len(detail_urls)}")
+
+        t_list1 = time.perf_counter()
 
         detail_urls = detail_urls[: cfg.max_items]
 
         items: List[ExtractedItem] = []
+        total_detail_fetch_s = 0.0
 
         for url in detail_urls:
             try:
-                item = self._extract_from_detail(url)
+                t_d0 = time.perf_counter()
+                item, detail_stats = self._extract_from_detail(url)
+                t_d1 = time.perf_counter()
+                total_detail_fetch_s += (t_d1 - t_d0)
+
+                for k, v in detail_stats.items():
+                    stats[k] = stats.get(k, 0) + v
+
                 if item:
                     items.append(item)
+                    stats["ok"] += 1
             except Exception as e:
+                stats["detail_parse_failed"] += 1
                 print(f"[eventbrite] detail parse failed: {url} | err: {repr(e)}")
                 continue
 
+        t1 = time.perf_counter()
+        listing_s = t_list1 - t_list0
+        total_s = t1 - t0
+
         print(f"[eventbrite] items built: {len(items)}")
+        print(f"[eventbrite] stats: {stats}")
+        print(
+            f"[eventbrite][timing]"
+            f" listing_s={listing_s:.2f}"
+            f" details_s={total_detail_fetch_s:.2f}"
+            f" total_s={total_s:.2f}"
+            f" urls={len(detail_urls)}"
+            f" listing_js_fallback={stats['listing_js_fallback_used']}"
+            f" detail_nonjs_ok={stats['detail_nonjs_ok']}"
+            f" detail_js_fallback={stats['detail_js_fallback_used']}"
+        )
+
         return items
 
     # ------------------------------------------------------------------
@@ -91,21 +211,42 @@ class EventbriteAdapter(BaseAdapter):
         return urls
 
     # ------------------------------------------------------------------
-    # Detail extraction
+    # Detail extraction (non-JS first, JS fallback)
     # ------------------------------------------------------------------
 
-    def _extract_from_detail(self, detail_url: str) -> ExtractedItem | None:
-        print("[eventbrite] parsing detail:", detail_url)
+    def _extract_from_detail(self, detail_url: str) -> tuple[ExtractedItem | None, Dict[str, int]]:
+        detail_stats: Dict[str, int] = {}
 
-        res = http_get(detail_url, render_js=True)
-        html = res.text or ""
-        soup = BeautifulSoup(html, "html.parser")
+        # Attempt 1: non-JS
+        print("[eventbrite] parsing detail (non-JS):", detail_url)
+        res1 = http_get(detail_url, render_js=False)
+        html1 = res1.text or ""
+        soup1 = BeautifulSoup(html1, "html.parser")
 
+        item = self._try_extract(soup1, html1, detail_url)
+        if item:
+            detail_stats["detail_nonjs_ok"] = 1
+            return item, detail_stats
+
+        # Attempt 2: JS fallback
+        print("[eventbrite] non-JS extraction failed, retrying with JS:", detail_url)
+        detail_stats["detail_js_fallback_used"] = 1
+        res2 = http_get(detail_url, render_js=True)
+        html2 = res2.text or ""
+        soup2 = BeautifulSoup(html2, "html.parser")
+
+        item = self._try_extract(soup2, html2, detail_url)
+        return item, detail_stats
+
+    def _try_extract(self, soup: BeautifulSoup, html: str, detail_url: str) -> ExtractedItem | None:
+        """
+        Attempt full extraction from parsed HTML. Returns item or None.
+        Does NOT print skip reasons (caller handles logging).
+        """
         structured = extract_jsonld_event(soup)
 
         title = self._get_title_from_jsonld(soup) or self._get_title_from_page(soup)
         if not title:
-            print("[eventbrite] skip (no title):", detail_url)
             return None
 
         location_raw = (
@@ -114,16 +255,13 @@ class EventbriteAdapter(BaseAdapter):
         )
 
         if self._is_online_event(soup, location_raw):
-            print("[eventbrite] skip (online):", detail_url)
             return None
 
         if location_raw:
             if not self._looks_like_zurich(detail_url, location_raw):
-                print("[eventbrite] skip (not zurich):", detail_url)
                 return None
         else:
             if not _ZH_HINT_RE.search(detail_url.lower()):
-                print("[eventbrite] skip (no location + no zurich hint):", detail_url)
                 return None
 
         if structured and structured.start_iso:
@@ -136,13 +274,11 @@ class EventbriteAdapter(BaseAdapter):
             extraction_method = "text_heuristic"
             datetime_raw = self._extract_datetime_text(soup)
             if not datetime_raw:
-                print("[eventbrite] skip (no datetime):", detail_url)
                 return None
 
-        image_url = self._extract_image_url(soup)
+        raw_image_url = self._extract_image_url(soup)
+        image_url = resolve_eventbrite_image_url(raw_image_url, detail_url)
         description_raw = self._get_description(soup)
-
-        print("[eventbrite] KEEP:", title[:80])
 
         return ExtractedItem(
             title_raw=title,
