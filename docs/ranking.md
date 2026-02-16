@@ -116,6 +116,27 @@ This is a soft ranking signal, not a hard limit. All cards still appear.
 **Rule:** `editorial_priority` is NEVER set by heuristic tagging or
 automated processes. It is reserved for explicit admin/editorial action.
 
+### Editorial priority (locked)
+
+`happening.editorial_priority` is a manual override used only for
+ordering within the feed contract.
+
+Allowed range: `[-100, 100]`
+
+Semantics:
+- `NULL` → no override
+- `1–49` → soft boost
+- `50–89` → strong promotion
+- `90–100` → pinned (top of section)
+- `< 0` → deprioritize (rare)
+
+Hard rules:
+- Editorial priority reorders only.
+- It does not bypass eligibility.
+- It does not bypass provenance gate.
+- It does not create parallel feed logic.
+- Feed remains a single contract (`public.feed_cards_view`).
+
 ---
 
 ## ORDER BY contract (target)
