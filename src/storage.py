@@ -126,10 +126,14 @@ def enqueue_source_happening(ev: NormalizedEvent) -> None:
     image_url = _extract_image_url(ev.extra)
 
     extraction_method = None
+    source_tier = "A"
     if isinstance(ev.extra, dict):
         em = ev.extra.get("extraction_method")
         if isinstance(em, str):
             extraction_method = em.strip() or None
+        st = ev.extra.get("source_tier")
+        if isinstance(st, str) and st.strip().upper() in ("A", "B", "C"):
+            source_tier = st.strip().upper()
 
     item_url = (ev.canonical_url or "").strip() or None
     external_id = (ev.external_id or "").strip() or None
@@ -171,7 +175,7 @@ def enqueue_source_happening(ev: NormalizedEvent) -> None:
     payload: dict[str, Any] = {
         "source_id": ev.source_id,
         "source_type": "crawler",
-        "source_tier": "A",
+        "source_tier": source_tier,
         "external_id": external_id,
         "title_raw": ev.title,
         "datetime_raw": None,

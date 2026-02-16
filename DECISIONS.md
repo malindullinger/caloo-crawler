@@ -88,8 +88,48 @@ To keep canonicalization deterministic and to prevent review noise from accumula
 
 ### Follow-up implementation notes
 - Maintain a small banlist for known PDF/header noise titles.
-- Ensure merge loops explicitly process `needs_review` rows (not only “pending/new”),
+- Ensure merge loops explicitly process `needs_review` rows (not only "pending/new"),
   so the system remains self-healing over time.
 
 ---
 
+## Decision: Phase 1 — ingestion defaults to `visibility_status = 'published'`
+
+**Date:** 2026-02-16
+
+**Context:**
+`create_happening_schedule_occurrence()` creates new canonical happenings when
+the merge loop decides `kind = "create"`. The feed (`feed_cards_view`) requires
+`visibility_status = 'published'` — draft happenings are invisible.
+
+Previously the default was `"draft"`, which silently orphaned all happenings
+created by the merge loop for sources without a pre-existing legacy bridge
+(eventbrite_zurich, elternverein_uetikon). Migration 021 published the
+existing drafts; the code now defaults to `"published"`.
+
+**Policy (Phase 1):**
+- All happenings created by the merge loop are immediately **published**.
+- No moderation UI exists yet; the feed shows all future scheduled events.
+- Eligibility filtering (`published` + `scheduled` + `start_at IS NOT NULL` +
+  not in the past) is the only gate.
+
+**Rationale:**
+- Phase 1 product rule: show parents everything that's upcoming — no curation.
+- Source data has already passed pipeline validation, dedupe-key computation,
+  and merge-loop scoring before reaching the CREATE path.
+- A `"draft"` default with no publishing mechanism is a silent data loss bug,
+  not a safety feature.
+
+**Future (when moderation exists):**
+- Revisit default when an Admin UI or moderation workflow is built.
+- Possible options: default to `"draft"` for Tier B/C sources, source-tier
+  gating, or manual approval queues.
+- Until then, `"published"` is the only correct default.
+
+**Files:**
+- `src/canonicalize/merge_loop.py` line 498 — sets the default
+- `migrations/021_publish_draft_happenings.sql` — one-time fix for existing drafts
+- `tests/test_canonical_field_invariants.py` — `test_create_sets_visibility_published`
+- `tests/test_source_to_canonical_chain.py` — regression tests
+
+---

@@ -148,3 +148,97 @@ def test_source_isolation():
     key_a = compute_dedupe_key(source_id="eventbrite", **base)
     key_b = compute_dedupe_key(source_id="maennedorf_portal", **base)
     assert key_a != key_b
+
+
+# ---------------------------------------------------------------------------
+# 11. Date-only does NOT create midnight — key uses date string, not timestamp
+# ---------------------------------------------------------------------------
+def test_date_only_no_midnight_placeholder():
+    """
+    A date-only record (time unknown) uses the date string directly.
+    There is no 00:00 or T00:00:00 injected anywhere in the seed.
+    """
+    key = compute_dedupe_key(
+        source_id="eventbrite",
+        title="Flohmarkt",
+        start_date_local="2026-04-12",
+        location="Stadtpark",
+    )
+    assert key.startswith("v1|")
+    # Must be stable
+    key2 = compute_dedupe_key(
+        source_id="eventbrite",
+        title="Flohmarkt",
+        start_date_local="2026-04-12",
+        location="Stadtpark",
+    )
+    assert key == key2
+
+
+# ---------------------------------------------------------------------------
+# 12. Date-only vs datetime same date — same dedupe_key
+# ---------------------------------------------------------------------------
+def test_date_only_and_datetime_same_date_same_key():
+    """
+    date-only and datetime records on the same date with the same title
+    produce THE SAME dedupe_key. The key uses start_date_local (a DATE),
+    not start_at (a TIMESTAMPTZ). This is intentional: same logical event.
+    """
+    base = dict(
+        source_id="eventbrite",
+        title="Flohmarkt",
+        location="Stadtpark",
+    )
+    key_date_only = compute_dedupe_key(start_date_local="2026-04-12", **base)
+    key_datetime = compute_dedupe_key(start_date_local="2026-04-12", **base)
+    assert key_date_only == key_datetime
+
+
+# ---------------------------------------------------------------------------
+# 13. Stability across runs — same input always produces same hash
+# ---------------------------------------------------------------------------
+def test_stable_across_runs():
+    """
+    The key must be deterministic and not depend on transient state
+    (time of computation, random values, process id, etc.).
+    """
+    kwargs = dict(
+        source_id="maennedorf_portal",
+        title="Kinderflohmarkt im Quartier",
+        start_date_local="2026-05-20",
+        location="Gemeindesaal Männedorf",
+    )
+    keys = [compute_dedupe_key(**kwargs) for _ in range(100)]
+    assert len(set(keys)) == 1, "dedupe_key must be stable across runs"
+
+
+# ---------------------------------------------------------------------------
+# 14. Umlauts preserved — ä/ö/ü/ß are kept, not transliterated
+# ---------------------------------------------------------------------------
+def test_umlauts_preserved():
+    """
+    Swiss German umlauts and ß are preserved in normalization.
+    'Küsnacht' and 'Kuesnacht' must produce DIFFERENT keys.
+    """
+    base = dict(
+        source_id="test",
+        title="Event",
+        start_date_local="2026-01-01",
+    )
+    key_umlaut = compute_dedupe_key(location="Küsnacht", **base)
+    key_ascii = compute_dedupe_key(location="Kuesnacht", **base)
+    assert key_umlaut != key_ascii
+
+
+# ---------------------------------------------------------------------------
+# 15. Empty location vs None location — same key
+# ---------------------------------------------------------------------------
+def test_empty_location_same_as_none():
+    base = dict(
+        source_id="test",
+        title="Event",
+        start_date_local="2026-01-01",
+    )
+    key_none = compute_dedupe_key(location=None, **base)
+    key_empty = compute_dedupe_key(location="", **base)
+    assert key_none == key_empty

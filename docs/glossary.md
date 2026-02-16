@@ -1,6 +1,8 @@
 # Glossary — Caloo Domain Terminology
 
 > **This document is normative.** All code, documentation, and communication should use these terms consistently.
+>
+> For UI label mapping (backend terms → user-facing text) see [ui-terminology.md](ui-terminology.md).
 
 ---
 

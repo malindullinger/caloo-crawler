@@ -231,15 +231,15 @@ def test_create_uses_raw_fields_verbatim():
     assert happening_payload["description"] == "  Spielerisches Yoga  "
 
 
-def test_create_sets_visibility_draft():
-    """New canonical happenings default to visibility_status='draft'."""
+def test_create_sets_visibility_published():
+    """New canonical happenings are immediately published (feed-visible)."""
     from src.canonicalize.merge_loop import create_happening_schedule_occurrence
 
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW)
 
     happening_payload = builder.insert.call_args_list[0][0][0]
-    assert happening_payload["visibility_status"] == "draft"
+    assert happening_payload["visibility_status"] == "published"
 
 
 def test_review_does_not_auto_overwrite_canonical():

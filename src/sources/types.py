@@ -14,6 +14,7 @@ class SourceConfig:
     max_items: int = 100
     enabled: bool = True
     extra: Dict[str, Any] | None = None
+    source_tier: str = "A"
 
 
 @dataclass

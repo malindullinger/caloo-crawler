@@ -20,9 +20,11 @@
 
 ---
 
-## Out of Scope
+## Status
 
-**This document is an audit only.** No crawler logic, SQL, or views are changed as part of this task. Implementation of improvements is deferred.
+This document was originally an audit (2026-02-08). Section 0 tracks
+implemented improvements. Sections 1–7 are updated to reflect current
+state (last reviewed: 2026-02).
 
 ---
 
@@ -84,7 +86,8 @@ Supports these patterns (in order of precedence):
 
 | Adapter | Status | Extraction Strategy |
 |---------|--------|---------------------|
-| `MaennedorfPortalAdapter` | ✅ Implemented | HTML lead container; prefers lines with "Uhr", falls back to lines with year/date |
+| `MaennedorfPortalAdapter` | ✅ Implemented | HTML lead container; prefers lines with "Uhr"; text heuristic fallback (Tier B) |
+| `EventbriteAdapter` | ✅ Implemented | JSON-LD primary (`extract_jsonld_event`); text heuristic fallback; non-JS first, JS fallback (Tier A) |
 | `ChurchHubAdapter` | ⚠️ TODO stub | Not implemented |
 | `KinoWildenmannAdapter` | ⚠️ TODO stub | Not implemented |
 | `VereinsDirectoryAdapter` | ⚠️ Discovery only | Returns no events |
@@ -119,17 +122,18 @@ Supports these patterns (in order of precedence):
 |---------|---------|--------|
 | English month names | `"Jan 22, 2026"` | Falls back to dateparser (may work) |
 | Non-standard separators | `"22/01/2026"` | May fail regex, dateparser fallback |
-| ISO format | `"2026-01-22T15:00:00"` | Not explicitly handled, dateparser fallback |
+| ISO format | `"2026-01-22T15:00:00"` | ✅ Now handled by `structured_time.py` and `_has_time_hint()` |
 
 ### 3.4 Structural Extraction Issues
 
-| Source Pattern | Failure Mode |
-|----------------|--------------|
+| Source Pattern | Status |
+|----------------|--------|
 | **HTML tables** | Not parsed; datetime may be in `<td>` cells |
-| **JSON-LD / Schema.org** | Not extracted; `startDate`/`endDate` ignored |
+| **JSON-LD / Schema.org** | ✅ **Implemented** — `extract_jsonld_event()` in `structured_time.py`. Used by Eventbrite adapter. |
+| **HTML `<time>` elements** | ✅ **Implemented** — `extract_time_element()` in `structured_time.py`. |
 | **ICS/Calendar embeds** | Not parsed; `.ics` links not followed |
 | **PDFs** | Not fetched; PDF content inaccessible |
-| **JavaScript-rendered** | Partial support (Playwright); some dynamic content missed |
+| **JavaScript-rendered** | Partial support (Playwright); JS fallback used by Eventbrite + Maennedorf |
 
 ### 3.5 Multi-Line / Split Datetime
 
@@ -149,22 +153,23 @@ Supports these patterns (in order of precedence):
 | Pattern Type | Current Support | Notes |
 |--------------|-----------------|-------|
 | **1. HTML visible text** | ✅ Partial | Works for lead containers, misses tables |
-| **2. `<time>` tags / structured data** | ❌ Not implemented | JSON-LD, microdata, Schema.org ignored |
-| **3. HTML tables** | ❌ Not implemented | Common in event listings |
-| **4. PDFs** | ❌ Not implemented | Would need PDF parsing library |
-| **5. Calendar embeds / ICS** | ❌ Not implemented | Would need ICS parser |
+| **2. JSON-LD Event markup** | ✅ Implemented | `extract_jsonld_event()` — supports Event + subtypes (e.g. `SocialEvent`) |
+| **3. HTML `<time>` elements** | ✅ Implemented | `extract_time_element()` — smart candidate selection |
+| **4. HTML tables** | ❌ Not implemented | Common in event listings |
+| **5. PDFs** | ❌ Not implemented | Would need PDF parsing library |
+| **6. Calendar embeds / ICS** | ❌ Not implemented | Would need ICS parser |
 
 ---
 
 ## 5. Prioritized Improvement Ideas
 
-### P0 — High Impact, Low Effort
+### P0 — High Impact, Low Effort (DONE)
 
-| Improvement | Rationale |
-|-------------|-----------|
-| **Extract JSON-LD `startDate`/`endDate`** | Many sites include Schema.org Event markup; provides exact ISO datetimes |
-| **Parse `<time datetime="...">` tags** | HTML5 standard; contains machine-readable datetime |
-| **Improve `_has_time_hint()` to catch `HH:MM` without "Uhr"** | Reduces false `date_precision='date'` |
+| Improvement | Status |
+|-------------|--------|
+| **Extract JSON-LD `startDate`/`endDate`** | ✅ Implemented in `structured_time.py` (2026-02-09) |
+| **Parse `<time datetime="...">` tags** | ✅ Implemented in `structured_time.py` (2026-02-09) |
+| **Improve `_has_time_hint()` to catch ISO format** | ✅ Updated to recognize ISO datetime strings |
 
 ### P1 — Medium Impact, Medium Effort
 
@@ -200,18 +205,18 @@ Once improvements are implemented, track:
 
 ## 7. Summary
 
-**Current state:**
-- Time extraction relies on German-specific regex + dateparser fallback
-- Only `MaennedorfPortalAdapter` is fully implemented
-- Structured data (JSON-LD, `<time>` tags) is not used
+**Current state (Feb 2026):**
+- JSON-LD and `<time>` extraction implemented (`structured_time.py`)
+- Two adapters fully operational: `MaennedorfPortalAdapter` (Tier B), `EventbriteAdapter` (Tier A)
+- German-specific regex + dateparser as fallback for non-structured sources
 - Tables, PDFs, and ICS calendars are not parsed
 
-**Impact:**
-- Some events get `date_precision='date'` when time is available but not recognized
-- Many events have `end_at=NULL` when end time exists but is not captured
+**Remaining impact:**
+- Non-structured sources still get `date_precision='date'` when time exists but isn't in JSON-LD or `<time>`
+- Some events have `end_at=NULL` when end time exists but is not captured
 - Ongoing detection fails for events missing `end_at`
 
 **Next steps (deferred):**
-- Implement P0 improvements (JSON-LD, `<time>` tags, better time hint detection)
-- Complete stub adapters
-- Track metrics to measure improvement
+- Complete stub adapters (ChurchHub, KinoWildenmann)
+- Table extraction for HTML-table-based event listings
+- Track metrics to measure ongoing improvement

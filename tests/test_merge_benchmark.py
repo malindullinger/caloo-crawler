@@ -23,6 +23,7 @@ EXPECTED_KEYS = {
     "errors",
     "canonical_updates",
     "history_rows",
+    "dedupe_fast_path",
 }
 
 

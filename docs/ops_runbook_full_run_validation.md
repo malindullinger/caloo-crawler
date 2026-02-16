@@ -100,6 +100,41 @@ Key metrics:
 | `avg_detail_s` | < 0.5s | > 2s = network or parsing issue |
 | `workers` | 10 | Check env var if different |
 
+### Pipeline summary line
+
+Every pipeline run emits a deterministic, grep-friendly summary:
+
+```bash
+grep '\[pipeline\]\[summary\]' /tmp/pipeline.log
+```
+
+Expected output shape:
+
+```
+[pipeline][summary] sources_run=2 extracted=164 normalized_written=160 source_upserted=158 normalize_failed=4 upsert_errors=0 dedupe_content=12 dedupe_fallback=3 dedupe_error=0 errors=4
+```
+
+Key counters:
+
+| Counter | Meaning | Good | Investigate |
+|---------|---------|------|-------------|
+| `sources_run` | Source configs attempted | Matches configured sources | 0 = config issue |
+| `extracted` | Raw items from adapters | ~expected per source | Much lower = adapter issue |
+| `normalized_written` | Events after normalize | Close to `extracted` | Large gap = normalize failures |
+| `source_upserted` | Rows written to `source_happenings` | Close to `normalized_written` | Gap = upsert errors |
+| `normalize_failed` | Events that failed normalization | 0–5 | > 10% of extracted = parser issue |
+| `upsert_errors` | Individual event upsert failures | 0 | > 0 = DB constraint or connectivity |
+| `dedupe_content` | Content-hash dedupes (identical re-crawl) | Any value normal | |
+| `dedupe_fallback` | Fallback-hash dedupes | Any value normal | |
+| `dedupe_error` | Dedupe computation errors | 0 | > 0 = dedupe_key bug |
+| `errors` | Total errors (`normalize_failed + upsert_errors + dedupe_error`) | 0 | > 0 = check above |
+
+All values are integers. The line is parseable with:
+
+```bash
+grep '\[pipeline\]\[summary\]' /tmp/pipeline.log | grep -oP '\w+=\d+'
+```
+
 ### Merge run stats
 
 ```bash
@@ -145,6 +180,16 @@ LIMIT 1;
 - [ ] `finished_at` is non-null (run completed)
 - [ ] `confidence_avg` is non-null (if any rows were scored)
 - [ ] `source_breakdown` JSON has `maennedorf_portal` key
+
+### Detail view sanity check
+
+After migration 023, verify `occurrence_detail_view` returns data.
+Full validation queries: [detail-page-validation.md](detail-page-validation.md).
+
+```sql
+SELECT count(*) AS detail_rows FROM occurrence_detail_view;
+-- Should roughly match: SELECT count(*) FROM feed_cards_view;
+```
 
 ### DB state
 

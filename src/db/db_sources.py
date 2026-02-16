@@ -11,7 +11,7 @@ class DbSourceRow:
     adapter: str
     seed_url: str
     max_items: int
-    tier: int
+    source_tier: str
     is_enabled: bool
     notes: Optional[str] = None
     timezone: Optional[str] = None
@@ -77,12 +77,9 @@ class DbSourcesLoader:
             adapter = str(r.get("adapter", "")).strip()
             seed_url = str(r.get("seed_url", "")).strip()
 
-            # tier is TEXT in your schema -> coerce safely
-            tier_raw = r.get("tier", None)
-            try:
-                tier_int = int(str(tier_raw).strip()) if tier_raw is not None else 0
-            except Exception:
-                tier_int = 0
+            # tier is TEXT in DB schema ('A', 'B', 'C')
+            tier_raw = str(r.get("tier", "") or "").strip().upper()
+            source_tier = tier_raw if tier_raw in ("A", "B", "C") else "A"
 
             max_items_raw = r.get("max_items", 100)
             try:
@@ -96,7 +93,7 @@ class DbSourcesLoader:
                     adapter=adapter,
                     seed_url=seed_url,
                     max_items=max_items_int,
-                    tier=tier_int,
+                    source_tier=source_tier,
                     is_enabled=bool(r.get("is_enabled", True)),
                     notes=r.get("notes"),
                     timezone=r.get("timezone"),

@@ -25,7 +25,15 @@ from src.canonicalize.reviews_supabase import (
     mark_source_needs_review,
     write_ambiguous_match_review,
 )
+from src.canonicalize.confidence import compute_confidence_score as compute_quality_score
+from src.canonicalize.scoring import compute_relevance_score
+from src.canonicalize.tagging import (
+    infer_audience_tags,
+    infer_topic_tags,
+    pg_array_literal,
+)
 from src.db.canonical_field_history import (
+    FieldChange,
     diff_happening_fields,
     log_field_changes,
 )
@@ -81,6 +89,23 @@ def execute_with_retry(rb, *, tries: int = 6, base_sleep: float = 0.5):
             )
             time.sleep(sleep)
     raise last  # type: ignore[misc]
+
+
+def _quality_score_from_source_row(
+    source_row: Mapping[str, Any],
+    happening_description: str | None = None,
+) -> int:
+    """Compute data-quality confidence score from source_happenings fields."""
+    description = happening_description or source_row.get("description_raw")
+    return compute_quality_score(
+        source_tier=source_row.get("source_tier"),
+        date_precision=source_row.get("date_precision"),
+        image_url=source_row.get("image_url"),
+        description=description,
+        canonical_url=source_row.get("item_url"),
+        timezone=source_row.get("timezone"),
+        extraction_method=source_row.get("extraction_method"),
+    )
 
 
 def source_priority_from_row(source_row: Mapping[str, Any]) -> int:
@@ -201,6 +226,100 @@ def claim_source_happenings(
         )
         .in_("id", ids)
     )
+
+
+def lookup_happening_by_dedupe_key(
+    supabase: Client,
+    source_row: Mapping[str, Any],
+) -> str | None:
+    """
+    Dedupe-key fast path: check if a previously-processed source_happening
+    with the same (source_id, dedupe_key) is already linked to a canonical
+    happening via happening_sources.
+
+    This avoids redundant fuzzy scoring on re-runs of the same source.
+
+    Returns: happening_id if found, None otherwise.
+
+    Guarantees:
+      - Read-only (no writes).
+      - Only matches within the same source (source_id scoped).
+      - Only matches processed rows (status='processed').
+      - Returns None if the linked happening is archived.
+      - Does not change any decision logic — just a performance shortcut
+        that produces the same merge result as fuzzy scoring would.
+      - Any error gracefully falls back to None (fuzzy path takes over).
+    """
+    try:
+        dedupe_key = source_row.get("dedupe_key")
+        source_name = source_row.get("source_id")
+        row_id = str(source_row.get("id") or "")
+
+        if not dedupe_key or not source_name:
+            return None
+
+        # Find a sibling: another source_happening row with the same
+        # (source_id, dedupe_key) that is already processed.
+        siblings = (
+            execute_with_retry(
+                supabase.table("source_happenings")
+                .select("id")
+                .eq("source_id", source_name)
+                .eq("dedupe_key", dedupe_key)
+                .eq("status", STATUS_PROCESSED)
+                .neq("id", row_id)
+                .limit(1)
+            ).data
+            or []
+        )
+
+        if not siblings or not isinstance(siblings, list):
+            return None
+
+        sibling_id = siblings[0].get("id")
+        if not sibling_id:
+            return None
+
+        # Look up the happening linked to the sibling via happening_sources.
+        links = (
+            execute_with_retry(
+                supabase.table("happening_sources")
+                .select("happening_id")
+                .eq("source_happening_id", str(sibling_id))
+                .limit(1)
+            ).data
+            or []
+        )
+
+        if not links or not isinstance(links, list):
+            return None
+
+        happening_id = links[0].get("happening_id")
+        if not happening_id:
+            return None
+
+        # Verify the happening is not archived.
+        happenings = (
+            execute_with_retry(
+                supabase.table("happening")
+                .select("id,visibility_status")
+                .eq("id", str(happening_id))
+                .limit(1)
+            ).data
+            or []
+        )
+
+        if not happenings or not isinstance(happenings, list):
+            return None
+
+        if happenings[0].get("visibility_status") == "archived":
+            return None
+
+        return str(happening_id)
+
+    except Exception:
+        # Fast path is best-effort. Any failure falls back to fuzzy scoring.
+        return None
 
 
 def fetch_candidate_bundles(
@@ -384,11 +503,28 @@ def create_happening_schedule_occurrence(
 
     Returns: happening_id
     """
-    happening_payload = {
+    audience_tags = infer_audience_tags(
+        source_row.get("title_raw"), source_row.get("description_raw"),
+    )
+    topic_tags = infer_topic_tags(
+        source_row.get("title_raw"), source_row.get("description_raw"),
+    )
+
+    happening_payload: dict[str, Any] = {
         "title": source_row.get("title_raw"),
         "description": source_row.get("description_raw"),
-        "visibility_status": "draft",  # safe default
+        "visibility_status": "published",
     }
+    if audience_tags:
+        happening_payload["audience_tags"] = audience_tags
+    if topic_tags:
+        happening_payload["topic_tags"] = topic_tags
+
+    score = compute_relevance_score(audience_tags, topic_tags)
+    if score != 0:
+        happening_payload["relevance_score_global"] = score
+
+    happening_payload["confidence_score"] = _quality_score_from_source_row(source_row)
 
     happening = execute_with_retry(
         supabase.table("happening").insert(happening_payload)
@@ -466,6 +602,129 @@ def update_happening_on_merge(
     )
 
     return (len(changes), history_inserts)
+
+
+def _recompute_confidence_on_merge(
+    *,
+    supabase: Client,
+    happening_id: str,
+    source_row: Mapping[str, Any],
+) -> bool:
+    """
+    Recompute data-quality confidence score after a merge.
+
+    Uses the source_row's metadata (best available at merge time) and
+    the happening's description (if present) to compute the score.
+    Only writes if the score has changed (idempotent).
+
+    Returns: True if the score was updated, False otherwise.
+    """
+    current = execute_with_retry(
+        supabase.table("happening")
+        .select("confidence_score,description")
+        .eq("id", happening_id)
+        .limit(1)
+    ).data
+    if not current:
+        return False
+
+    current_score = current[0].get("confidence_score", 100)
+    happening_desc = current[0].get("description")
+
+    new_score = _quality_score_from_source_row(source_row, happening_desc)
+
+    if new_score == current_score:
+        return False
+
+    execute_with_retry(
+        supabase.table("happening")
+        .update({"confidence_score": new_score})
+        .eq("id", happening_id)
+    )
+    return True
+
+
+def apply_heuristic_tags(
+    *,
+    supabase: Client,
+    happening_id: str,
+    source_row: Mapping[str, Any],
+) -> tuple[int, int]:
+    """
+    Apply heuristic audience/topic tags to a canonical happening,
+    but ONLY when the existing tags are empty (admin edits win).
+
+    Never modifies editorial_priority.
+
+    Returns: (field_updates_count, history_rows_inserted)
+    """
+    current = execute_with_retry(
+        supabase.table("happening")
+        .select("id,audience_tags,topic_tags,relevance_score_global,title,description")
+        .eq("id", happening_id)
+        .limit(1)
+    ).data
+
+    if not current:
+        return (0, 0)
+
+    row = current[0]
+    existing_audience = row.get("audience_tags") or []
+    existing_topic = row.get("topic_tags") or []
+
+    # Both already populated → nothing to do (admin edits win)
+    if existing_audience and existing_topic:
+        return (0, 0)
+
+    # Prefer source_row text (fresher), fall back to happening text
+    title = source_row.get("title_raw") or row.get("title")
+    description = source_row.get("description_raw") or row.get("description")
+
+    update_payload: dict[str, Any] = {}
+    changes: list[FieldChange] = []
+
+    if not existing_audience:
+        new_audience = infer_audience_tags(title, description)
+        if new_audience:
+            update_payload["audience_tags"] = new_audience
+            changes.append(FieldChange(
+                field_name="audience_tags",
+                old_value=pg_array_literal([]),
+                new_value=pg_array_literal(new_audience),
+            ))
+
+    if not existing_topic:
+        new_topic = infer_topic_tags(title, description)
+        if new_topic:
+            update_payload["topic_tags"] = new_topic
+            changes.append(FieldChange(
+                field_name="topic_tags",
+                old_value=pg_array_literal([]),
+                new_value=pg_array_literal(new_topic),
+            ))
+
+    if not update_payload:
+        return (0, 0)
+
+    # Recompute relevance score from final tag state
+    final_audience = update_payload.get("audience_tags", existing_audience)
+    final_topic = update_payload.get("topic_tags", existing_topic)
+    new_score = compute_relevance_score(final_audience, final_topic)
+    current_score = row.get("relevance_score_global") or 0
+    if new_score != current_score:
+        update_payload["relevance_score_global"] = new_score
+
+    execute_with_retry(
+        supabase.table("happening").update(update_payload).eq("id", happening_id)
+    )
+
+    history_inserts = 0
+    if changes:
+        history_inserts = log_field_changes(
+            supabase, happening_id, str(source_row["id"]), changes,
+        )
+
+    return (len(update_payload), history_inserts)
 
 
 def link_happening_source(
@@ -558,6 +817,7 @@ def run_merge_loop(
         "errors": 0,
         "canonical_updates": 0,
         "history_rows": 0,
+        "dedupe_fast_path": 0,
     }
 
     # Per-source breakdown for observability (Phase 7)
@@ -607,6 +867,55 @@ def run_merge_loop(
                 source_id = str(source_row.get("id") or "")
                 src_name = str(source_row.get("source_id") or "unknown")
                 try:
+                    # -------------------------------------------------------
+                    # Dedupe-key fast path: if a sibling source_happening
+                    # with the same (source_id, dedupe_key) was already
+                    # processed and linked, skip fuzzy scoring entirely.
+                    # This is a performance optimization only — the merge
+                    # result is identical to what fuzzy scoring would produce.
+                    # -------------------------------------------------------
+                    fast_happening_id = lookup_happening_by_dedupe_key(
+                        supabase, source_row,
+                    )
+                    if fast_happening_id is not None:
+                        counts["merged"] += 1
+                        counts["dedupe_fast_path"] += 1
+                        source_breakdown[src_name]["merged"] += 1
+                        if not dry_run:
+                            link_happening_source(
+                                supabase=supabase,
+                                happening_id=fast_happening_id,
+                                source_row=source_row,
+                            )
+                            field_updates, history_inserts = update_happening_on_merge(
+                                supabase=supabase,
+                                happening_id=fast_happening_id,
+                                source_row=source_row,
+                            )
+                            tag_updates, tag_history = apply_heuristic_tags(
+                                supabase=supabase,
+                                happening_id=fast_happening_id,
+                                source_row=source_row,
+                            )
+                            counts["canonical_updates"] += field_updates + tag_updates
+                            counts["history_rows"] += history_inserts + tag_history
+                            source_breakdown[src_name]["field_updates"] += field_updates + tag_updates
+                            if _recompute_confidence_on_merge(
+                                supabase=supabase,
+                                happening_id=fast_happening_id,
+                                source_row=source_row,
+                            ):
+                                counts["canonical_updates"] += 1
+                            mark_source_processed(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                            ignore_open_reviews_for_source_row(
+                                supabase=supabase,
+                                source_happening_id=source_id,
+                            )
+                        continue
+
                     fingerprint = compute_fingerprint(source_row)
                     candidate_bundles = fetch_candidate_bundles(supabase, source_row)
                     decision = decide_match(source_row, candidate_bundles)
@@ -690,9 +999,20 @@ def run_merge_loop(
                                 happening_id=decision.best_happening_id,
                                 source_row=source_row,
                             )
-                            counts["canonical_updates"] += field_updates
-                            counts["history_rows"] += history_inserts
-                            source_breakdown[src_name]["field_updates"] += field_updates
+                            tag_updates, tag_history = apply_heuristic_tags(
+                                supabase=supabase,
+                                happening_id=decision.best_happening_id,
+                                source_row=source_row,
+                            )
+                            counts["canonical_updates"] += field_updates + tag_updates
+                            counts["history_rows"] += history_inserts + tag_history
+                            source_breakdown[src_name]["field_updates"] += field_updates + tag_updates
+                            if _recompute_confidence_on_merge(
+                                supabase=supabase,
+                                happening_id=decision.best_happening_id,
+                                source_row=source_row,
+                            ):
+                                counts["canonical_updates"] += 1
                             mark_source_processed(
                                 supabase=supabase,
                                 source_happening_id=source_id,

@@ -18,6 +18,7 @@ def _hardcoded_sources_fallback() -> List[SourceConfig]:
             seed_url="https://www.maennedorf.ch/anlaesseaktuelles?datumVon=22.01.2026&datumBis=30.12.2026",
             timezone="Europe/Zurich",
             max_items=50,
+            source_tier="B",
         ),
         SourceConfig(
             source_id="eventbrite_zurich",
@@ -25,6 +26,7 @@ def _hardcoded_sources_fallback() -> List[SourceConfig]:
             seed_url="https://www.eventbrite.com/d/switzerland--zurich/events/",
             timezone="Europe/Zurich",
             max_items=50,
+            source_tier="A",
         ),
         SourceConfig(
             source_id="elternverein_uetikon",
@@ -32,6 +34,7 @@ def _hardcoded_sources_fallback() -> List[SourceConfig]:
             seed_url="https://elternverein-uetikon.ch/veranstaltungen",
             timezone="Europe/Zurich",
             max_items=50,
+            source_tier="B",
         ),
     ]
 
@@ -75,6 +78,7 @@ def load_sources() -> List[SourceConfig]:
                 seed_url=r.seed_url,
                 max_items=r.max_items,
                 timezone=r.timezone or "Europe/Zurich",
+                source_tier=r.source_tier,
             )
             for r in rows
         ]
@@ -87,17 +91,22 @@ def load_sources() -> List[SourceConfig]:
         return sources
 
 
-def fetch_and_extract() -> List[RawEvent]:
+def fetch_and_extract() -> tuple[List[RawEvent], int]:
     """
     Entry point used by pipeline.py.
 
     Runs enabled sources sequentially. A single failing source does not crash the full run.
+
+    Returns (raws, sources_run) where sources_run is the number of source
+    configs that were attempted (including ones that errored).
     """
     sources = load_sources()
     now = datetime.now(timezone.utc)
     out: List[RawEvent] = []
+    sources_run = 0
 
     for cfg in sources:
+        sources_run += 1
         print(f"[source] start source_id={cfg.source_id} adapter={cfg.adapter} max_items={cfg.max_items}")
         try:
             adapter = get_adapter(cfg.adapter)
@@ -135,6 +144,9 @@ def fetch_and_extract() -> List[RawEvent]:
                     list((it.extra or {}).keys())[:10],
                 )
 
+            raw_extra = dict(it.extra or {})
+            raw_extra["source_tier"] = cfg.source_tier
+
             out.append(
                 RawEvent(
                     source_id=cfg.source_id,
@@ -144,7 +156,7 @@ def fetch_and_extract() -> List[RawEvent]:
                     datetime_raw=it.datetime_raw,
                     location_raw=it.location_raw,
                     description_raw=it.description_raw,
-                    extra=it.extra or {},
+                    extra=raw_extra,
                     fetched_at=it.fetched_at or now,
                 )
             )
@@ -152,4 +164,4 @@ def fetch_and_extract() -> List[RawEvent]:
         print(f"[source] done source_id={cfg.source_id} items={len(enriched)}")
 
     print(f"[sources] total_raws={len(out)}")
-    return out
+    return out, sources_run

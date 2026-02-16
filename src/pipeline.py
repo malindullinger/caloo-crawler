@@ -12,12 +12,11 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc)
 
     print("PIPELINE: about to fetch")
-    raws = fetch_and_extract()
+    raws, sources_run = fetch_and_extract()
     print("PIPELINE: fetch done")
 
     print(f"Raw events: {len(raws)}")
 
-    # ✅ DEBUG: prove whether image_url exists on RawEvent BEFORE storing
     sample_with_images = 0
     for r in raws[:25]:
         img = (r.extra or {}).get("image_url")
@@ -30,6 +29,9 @@ def main() -> None:
     print(f"DEBUG: raws with image_url in first 25 = {sample_with_images}")
 
     normalized = []
+    normalize_failed = 0
+    upserted = 0
+    upsert_errors = 0
 
     for r in raws:
         # 1) Always store raw evidence
@@ -38,6 +40,7 @@ def main() -> None:
         # 2) Normalize
         n = raw_to_normalized(r, now_utc=now_utc)
         if not n:
+            normalize_failed += 1
             print(
                 f"[pipeline] NORMALIZE_FAILED source_id={r.source_id}"
                 f" | title={r.title_raw!r}"
@@ -47,7 +50,13 @@ def main() -> None:
             continue
 
         # 3) Upsert normalized event
-        upsert_event(n)
+        try:
+            upsert_event(n)
+            upserted += 1
+        except Exception as e:
+            upsert_errors += 1
+            print(f"[pipeline] UPSERT_ERROR source_id={n.source_id} | {type(e).__name__}: {e}")
+            continue
 
         # 4) Insert schedules
         insert_schedules(
@@ -73,6 +82,25 @@ def main() -> None:
         f"[dedupe_key] content_based={_DEDUPE_CONTENT} "
         f"fallback={_DEDUPE_FALLBACK} "
         f"error={_DEDUPE_ERROR}"
+    )
+
+    # ---------------------------------------------------------------
+    # Deterministic, grep-friendly summary line.
+    # grep '[pipeline][summary]' /tmp/pipeline.log
+    # ---------------------------------------------------------------
+    errors = normalize_failed + upsert_errors + _DEDUPE_ERROR
+    print(
+        f"[pipeline][summary]"
+        f" sources_run={sources_run}"
+        f" extracted={len(raws)}"
+        f" normalized_written={len(normalized)}"
+        f" source_upserted={upserted}"
+        f" normalize_failed={normalize_failed}"
+        f" upsert_errors={upsert_errors}"
+        f" dedupe_content={_DEDUPE_CONTENT}"
+        f" dedupe_fallback={_DEDUPE_FALLBACK}"
+        f" dedupe_error={_DEDUPE_ERROR}"
+        f" errors={errors}"
     )
 
 
