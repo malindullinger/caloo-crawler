@@ -133,3 +133,24 @@ existing drafts; the code now defaults to `"published"`.
 - `tests/test_source_to_canonical_chain.py` — regression tests
 
 ---
+
+## Decision — Minimum Trust Standard (MTS-v1.2)
+
+Caloo defines a Minimum Trust Standard (MTS) that determines:
+
+- Feed eligibility
+- trust_status state
+- Review triggers
+- Confidence scoring baseline
+
+MTS separates:
+
+Eligibility → structural + time-based visibility
+trust_status → governance clarity
+confidence_score → ranking modifier
+
+This prevents silent data drift and enforces responsible recommendation standards.
+
+This decision locks the Feed Integrity Layer contract before implementation.
+
+---

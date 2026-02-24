@@ -230,3 +230,37 @@ feed stays on `feed_cards_view` exclusively.
 | Ranking layer | [ranking.md](ranking.md) |
 | Feed health checks | [feed-health-checks.md](feed-health-checks.md) |
 | Tagging | [tagging.md](tagging.md) |
+| Minimum Trust Standard | [minimum-trust-standard.md](minimum-trust-standard.md) |
+
+---
+
+# Phase 9 — Feed Integrity Layer
+
+## Display Unit
+
+One occurrence per offering (next eligible upcoming OR currently ongoing).
+
+## Time Logic
+
+- upcoming → now < start_at
+- ongoing → start_at <= now < end_at
+- ending_soon → end_at - now <= 20 minutes
+- invisible → now >= end_at
+
+An occurrence disappears the moment:
+now >= end_at
+
+## Eligibility Rule
+
+Feed view must filter using:
+
+WHERE trust_status != 'suppressed'
+AND end_at > now()
+
+## Series Handling
+
+Only the next eligible occurrence per offering appears in the feed.
+
+Future occurrence count is derived from feed-eligible future occurrences.
+
+---
