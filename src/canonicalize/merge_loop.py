@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import time
@@ -13,7 +14,11 @@ from uuid import uuid4
 
 import httpx
 from supabase import Client, create_client
+from postgrest.exceptions import APIError
 
+from src.canonicalize.canonical_dedupe_key import (
+    compute_canonical_dedupe_key_from_source,
+)
 from src.canonicalize.matching import (
     CONFIDENCE_THRESHOLD,
     compute_fingerprint,
@@ -24,6 +29,7 @@ from src.canonicalize.reviews_supabase import (
     ignore_open_reviews_for_source_row,
     mark_source_needs_review,
     write_ambiguous_match_review,
+    write_constraint_violation_review,
 )
 from src.canonicalize.confidence import compute_confidence_score as compute_quality_score
 from src.canonicalize.scoring import compute_relevance_score
@@ -50,6 +56,17 @@ from src.db.merge_run_stats import (
 
 NEAR_TIE_DELTA = 0.03  # prevent wrong auto-merges
 
+# Editorial fields that the pipeline must NEVER overwrite.
+# These are set by admins and take absolute precedence.
+EDITORIAL_PROTECTED_FIELDS = frozenset({
+    "editorial_priority",
+    "visibility_override",
+    "override_reason",
+    "override_set_by",
+    "override_set_at",
+    "override_expires_at",
+})
+
 # If multiple candidates hit perfect confidence, force review (avoid duplicates / wrong merges)
 PERFECT_CONFIDENCE = 1.0
 PERFECT_TIE_EPS = 1e-9  # float safety
@@ -64,7 +81,6 @@ STATUS_IGNORED = "ignored"
 # Only v1 dedupe_key rows are processable (Phase 3 contract).
 # Legacy rows (URL-based keys) are permanently quarantined.
 DEDUPE_KEY_PREFIX = "v1|"
-
 
 def execute_with_retry(rb, *, tries: int = 6, base_sleep: float = 0.5):
     """
@@ -89,6 +105,12 @@ def execute_with_retry(rb, *, tries: int = 6, base_sleep: float = 0.5):
             )
             time.sleep(sleep)
     raise last  # type: ignore[misc]
+
+
+def _is_unique_violation(err: Exception) -> bool:
+    """Best-effort detection for Postgres 23505 unique_violation."""
+    s = repr(err).lower()
+    return "23505" in s or "duplicate key value violates unique constraint" in s
 
 
 def _quality_score_from_source_row(
@@ -154,6 +176,29 @@ def _pick_best_occurrence_for_offering(
     return occs[0]
 
 
+def _cv_fingerprint(*parts: str) -> str:
+    """Deterministic fingerprint for constraint violation reviews."""
+    seed = "|".join(parts)
+    return "cv|" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+def _compute_offering_nk_key(
+    happening_id: str,
+    offering_type: str,
+    timezone_str: str | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> str:
+    """
+    Compute the offering natural key, matching the SQL function
+    public.compute_offering_nk_key exactly.
+    """
+    tz = timezone_str or "Europe/Zurich"
+    sd = start_date if start_date is not None else "_"
+    ed = end_date if end_date is not None else "_"
+    return f"{happening_id}|{offering_type}|{tz}|{sd}|{ed}"
+
+
 # ---------------------------------------------------------------------------
 # Match decision
 # ---------------------------------------------------------------------------
@@ -174,6 +219,8 @@ def fetch_queued_source_happenings(
     supabase: Client,
     limit: int = 200,
     include_needs_review: bool = False,
+    *,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Select processable source_happenings.
@@ -183,10 +230,17 @@ def fetch_queued_source_happenings(
       2. status IN (queued [, needs_review])
 
     Legacy rows (URL-based keys) are permanently excluded regardless of status.
+
+    When exclude_ids is provided (dry-mode seen-set), fetches extra rows and
+    filters client-side, so we can page through without DB writes.
     """
     statuses = [STATUS_QUEUED]
     if include_needs_review:
         statuses.append(STATUS_NEEDS_REVIEW)
+
+    # In dry mode we may need to over-fetch to fill a batch after excluding
+    # already-seen ids. Fetch up to 5x the limit to compensate.
+    fetch_limit = limit if not exclude_ids else min(limit * 5, 1000)
 
     resp = execute_with_retry(
         supabase.table("source_happenings")
@@ -194,9 +248,14 @@ def fetch_queued_source_happenings(
         .like("dedupe_key", "v1|%")
         .in_("status", statuses)
         .order("created_at", desc=False)
-        .limit(limit)
+        .limit(fetch_limit)
     )
-    return resp.data or []
+    rows = resp.data or []
+
+    if exclude_ids:
+        rows = [r for r in rows if str(r.get("id", "")) not in exclude_ids]
+
+    return rows[:limit]
 
 
 def claim_source_happenings(
@@ -487,6 +546,159 @@ def decide_match(
 
 
 # ---------------------------------------------------------------------------
+# Offering: upsert by natural key (offering_nk_key)
+# ---------------------------------------------------------------------------
+
+def _get_or_create_offering(
+    *,
+    supabase: Client,
+    happening_id: str,
+    offering_type: str,
+    start_date: str | None,
+    end_date: str | None,
+    timezone_str: str | None,
+    run_id: str,
+    source_happening_id: str,
+    source_id: str,
+    counts: dict[str, int],
+) -> str | None:
+    """
+    Idempotent get-or-create for an offering by its natural key:
+      (happening_id, offering_type, timezone, start_date, end_date)
+
+    Uses offering_nk_key column with UNIQUE INDEX for true upsert.
+
+    Strategy:
+      1. Compute offering_nk_key deterministically.
+      2. Upsert: INSERT ... ON CONFLICT (offering_nk_key) DO UPDATE SET updated_at=now().
+      3. On any other error, fall back to SELECT.
+      4. If still unresolvable, create a constraint_violation review and return None.
+
+    Returns offering_id on success, None on unresolvable conflict.
+    """
+    tz = timezone_str or "Europe/Zurich"
+    nk_key = _compute_offering_nk_key(happening_id, offering_type, tz, start_date, end_date)
+
+    offering_payload: dict[str, Any] = {
+        "happening_id": happening_id,
+        "offering_type": offering_type,
+        "start_date": start_date,
+        "end_date": end_date or start_date,
+        "timezone": tz,
+        "offering_nk_key": nk_key,
+    }
+    # Filter None values except for fields that should remain
+    offering_payload = {k: v for k, v in offering_payload.items() if v is not None}
+
+    try:
+        resp = execute_with_retry(
+            supabase.table("offering")
+            .upsert(offering_payload, on_conflict="offering_nk_key")
+        )
+        row = resp.data[0]
+        if row.get("id") != row.get("id"):  # impossible, but defensive
+            pass
+        # Detect if this was a reuse (existing row) vs new insert
+        # We can't easily distinguish, but the counter helps observability
+        counts["offering_nk_reused"] = counts.get("offering_nk_reused", 0) + 1
+        return str(row["id"])
+    except (APIError, Exception) as e:
+        if not _is_unique_violation(e):
+            raise
+
+    # Race condition fallback: SELECT by nk_key
+    try:
+        resp = execute_with_retry(
+            supabase.table("offering")
+            .select("id")
+            .eq("offering_nk_key", nk_key)
+            .limit(1)
+        )
+        rows = resp.data or []
+        if rows:
+            counts["offering_nk_reused"] = counts.get("offering_nk_reused", 0) + 1
+            return str(rows[0]["id"])
+    except Exception:
+        pass
+
+    # Unresolvable — create review
+    fp = _cv_fingerprint("offering", happening_id, offering_type or "",
+                         tz, start_date or "", end_date or "")
+    write_constraint_violation_review(
+        supabase=supabase,
+        run_id=run_id,
+        source_happening_id=source_happening_id,
+        source_id=source_id,
+        fingerprint=fp,
+        constraint_name="offering_nk_key_unique",
+        details={
+            "happening_id": happening_id,
+            "offering_type": offering_type,
+            "start_date": start_date,
+            "end_date": end_date,
+            "timezone": tz,
+            "offering_nk_key": nk_key,
+        },
+    )
+    counts["reviews_created"] = counts.get("reviews_created", 0) + 1
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Occurrence: upsert by (happening_id, start_at, status) unique index
+# ---------------------------------------------------------------------------
+
+def _upsert_occurrence(
+    *,
+    supabase: Client,
+    offering_id: str,
+    happening_id: str,
+    start_at: str,
+    end_at: str | None,
+    counts: dict[str, int],
+) -> None:
+    """
+    Idempotent upsert for an occurrence using the non-partial unique index:
+      occurrence_happening_start_status_uq (happening_id, start_at, status)
+
+    Strategy:
+      1. Try UPSERT with happening_id and status='scheduled'.
+         The DB trigger trg_sync_occurrence_happening_id will also set
+         happening_id from offering, but we supply it explicitly for the
+         ON CONFLICT clause.
+      2. ON CONFLICT (happening_id, start_at, status) DO UPDATE sets
+         end_at if provided (idempotent enrichment).
+
+    Caller must ensure start_at is not None (strict contract).
+    """
+    occurrence_payload: dict[str, Any] = {
+        "offering_id": offering_id,
+        "happening_id": happening_id,
+        "start_at": start_at,
+        "status": "scheduled",
+    }
+    if end_at is not None:
+        occurrence_payload["end_at"] = end_at
+
+    try:
+        execute_with_retry(
+            supabase.table("occurrence")
+            .upsert(
+                occurrence_payload,
+                on_conflict="happening_id,start_at,status",
+            )
+        )
+        return
+    except (APIError, Exception) as e:
+        if not _is_unique_violation(e):
+            raise
+
+    # Fallback: the upsert hit a conflict we couldn't resolve via on_conflict.
+    # This means the row exists — count it as reused.
+    counts["occurrence_conflict_reused"] = counts.get("occurrence_conflict_reused", 0) + 1
+
+
+# ---------------------------------------------------------------------------
 # Create canonical chain
 # ---------------------------------------------------------------------------
 
@@ -494,15 +706,30 @@ def create_happening_schedule_occurrence(
     *,
     supabase: Client,
     source_row: Mapping[str, Any],
-) -> str:
+    run_id: str = "",
+    counts: dict[str, int] | None = None,
+) -> tuple[str, bool]:
     """
-    Create:
-      1) Happening (identity)
-      2) Offering (schedule)
-      3) Occurrence (instance)
+    Create or upsert:
+      1) Happening (identity) — deduplicated via canonical_dedupe_key
+      2) Offering (schedule) — upsert by offering_nk_key
+      3) Occurrence (instance) — upsert by (happening_id, start_at, status)
 
-    Returns: happening_id
+    If canonical_dedupe_key can be computed:
+      → upsert on canonical_dedupe_key; update only pipeline-safe fields
+        (never editorial_priority, visibility_override, visibility_status, etc.)
+    If canonical_dedupe_key is None/empty:
+      → plain insert + the row will need manual review
+
+    Returns: (happening_id, fully_resolved)
+      fully_resolved=True  → all steps succeeded, caller should mark processed.
+      fully_resolved=False → offering/occurrence had unresolvable constraint
+                              violation; review was logged; caller should mark
+                              needs_review instead of processed.
     """
+    if counts is None:
+        counts = {}
+
     audience_tags = infer_audience_tags(
         source_row.get("title_raw"), source_row.get("description_raw"),
     )
@@ -510,11 +737,14 @@ def create_happening_schedule_occurrence(
         source_row.get("title_raw"), source_row.get("description_raw"),
     )
 
+    canonical_key = compute_canonical_dedupe_key_from_source(source_row)
+
     happening_payload: dict[str, Any] = {
         "title": source_row.get("title_raw"),
         "description": source_row.get("description_raw"),
-        "visibility_status": "published",
     }
+    if canonical_key:
+        happening_payload["canonical_dedupe_key"] = canonical_key
     if audience_tags:
         happening_payload["audience_tags"] = audience_tags
     if topic_tags:
@@ -526,43 +756,71 @@ def create_happening_schedule_occurrence(
 
     happening_payload["confidence_score"] = _quality_score_from_source_row(source_row)
 
-    happening = execute_with_retry(
-        supabase.table("happening").insert(happening_payload)
-    ).data[0]
+    if canonical_key:
+        # Upsert: if a happening with this canonical_dedupe_key already exists,
+        # update only pipeline-safe fields. Never touch editorial or visibility.
+        upsert_payload = {
+            k: v for k, v in happening_payload.items()
+            if k not in EDITORIAL_PROTECTED_FIELDS
+            and k != "visibility_status"
+        }
+        happening = execute_with_retry(
+            supabase.table("happening")
+            .upsert(upsert_payload, on_conflict="canonical_dedupe_key")
+        ).data[0]
+    else:
+        # No canonical key — plain insert (fallback; should not happen for v1 rows).
+        print(f"[merge_loop] WARNING: no canonical_dedupe_key for source row {source_row.get('id')}")
+        happening = execute_with_retry(
+            supabase.table("happening").insert(happening_payload)
+        ).data[0]
+
     happening_id = happening["id"]
 
-    offering_payload = {
-        "happening_id": happening_id,
-        "offering_type": "one_off",
-        "start_date": source_row.get("start_date_local"),
-        "end_date": source_row.get("end_date_local") or source_row.get("start_date_local"),
-        "timezone": source_row.get("timezone"),
-    }
+    source_happening_id = str(source_row.get("id") or "")
+    source_id_str = str(source_row.get("source_id") or "unknown")
 
-    offering = execute_with_retry(
-        supabase.table("offering").insert(offering_payload)
-    ).data[0]
-    offering_id = offering["id"]
+    # --- Offering: upsert by offering_nk_key ---
+    start_date = source_row.get("start_date_local")
+    end_date = source_row.get("end_date_local") or start_date
 
+    offering_id = _get_or_create_offering(
+        supabase=supabase,
+        happening_id=happening_id,
+        offering_type="one_off",
+        start_date=start_date,
+        end_date=end_date,
+        timezone_str=source_row.get("timezone"),
+        run_id=run_id,
+        source_happening_id=source_happening_id,
+        source_id=source_id_str,
+        counts=counts,
+    )
+
+    if offering_id is None:
+        # Offering could not be created or found — review was logged.
+        # Signal to caller: source row should be marked needs_review, not processed.
+        return str(happening_id), False
+
+    # --- Occurrence: upsert by (happening_id, start_at, status) ---
     # Only create an occurrence when we have a real start_at timestamp.
     # Date-only items (date_precision='date', start_at=NULL) must NOT
     # produce occurrence rows — the DB enforces NOT NULL on start_at
     # and the time contract forbids inventing midnight placeholders.
     start_at = source_row.get("start_at")
-    if start_at is not None:
-        occurrence_payload = {
-            "offering_id": offering_id,
-            "start_at": start_at,
-            "end_at": source_row.get("end_at"),
-            "status": "scheduled",
-        }
-        occurrence_payload = {k: v for k, v in occurrence_payload.items() if v is not None}
-
-        execute_with_retry(
-            supabase.table("occurrence").insert(occurrence_payload)
+    if start_at is None:
+        counts["occurrence_null_start_skipped"] = counts.get("occurrence_null_start_skipped", 0) + 1
+    else:
+        _upsert_occurrence(
+            supabase=supabase,
+            offering_id=offering_id,
+            happening_id=happening_id,
+            start_at=start_at,
+            end_at=source_row.get("end_at"),
+            counts=counts,
         )
 
-    return str(happening_id)
+    return str(happening_id), True
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +838,11 @@ def update_happening_on_merge(
     If any differ (and source is non-null), update the happening and
     log the old→new transition to canonical_field_history.
 
+    SAFETY: editorial fields (editorial_priority, visibility_override, etc.)
+    and visibility_status are NEVER written by the pipeline.
+
+    Also backfills canonical_dedupe_key if the existing row is missing one.
+
     Returns: (field_updates_count, history_rows_inserted)
     """
     current = execute_with_retry(
@@ -589,10 +852,24 @@ def update_happening_on_merge(
         return (0, 0)
 
     changes = diff_happening_fields(current[0], source_row)
-    if not changes:
-        return (0, 0)
+    # Filter out editorial-protected fields (safety net)
+    changes = [
+        c for c in changes
+        if c.field_name not in EDITORIAL_PROTECTED_FIELDS
+        and c.field_name != "visibility_status"
+    ]
 
     update_payload = {c.field_name: c.new_value for c in changes}
+
+    # Backfill canonical_dedupe_key if missing on the existing row
+    if not current[0].get("canonical_dedupe_key"):
+        canonical_key = compute_canonical_dedupe_key_from_source(source_row)
+        if canonical_key:
+            update_payload["canonical_dedupe_key"] = canonical_key
+
+    if not update_payload:
+        return (0, 0)
+
     execute_with_retry(
         supabase.table("happening").update(update_payload).eq("id", happening_id)
     )
@@ -792,6 +1069,61 @@ def mark_source_processing_failed(
 
 
 # ---------------------------------------------------------------------------
+# Ensure occurrence on merge path
+# ---------------------------------------------------------------------------
+
+def _ensure_occurrence_on_merge(
+    *,
+    supabase: Client,
+    happening_id: str,
+    source_row: Mapping[str, Any],
+    run_id: str,
+    counts: dict[str, int],
+) -> None:
+    """
+    When merging a source_row into an existing happening, ensure that the
+    occurrence for the source's start_at exists. Previously, the merge path
+    did not create occurrences — only the create path did. This was a root
+    cause of missing occurrences for merged sources.
+    """
+    start_at = source_row.get("start_at")
+    if start_at is None:
+        counts["occurrence_null_start_skipped"] = counts.get("occurrence_null_start_skipped", 0) + 1
+        return
+
+    source_happening_id = str(source_row.get("id") or "")
+    source_id_str = str(source_row.get("source_id") or "unknown")
+
+    start_date = source_row.get("start_date_local")
+    end_date = source_row.get("end_date_local") or start_date
+
+    offering_id = _get_or_create_offering(
+        supabase=supabase,
+        happening_id=happening_id,
+        offering_type="one_off",
+        start_date=start_date,
+        end_date=end_date,
+        timezone_str=source_row.get("timezone"),
+        run_id=run_id,
+        source_happening_id=source_happening_id,
+        source_id=source_id_str,
+        counts=counts,
+    )
+
+    if offering_id is None:
+        return
+
+    _upsert_occurrence(
+        supabase=supabase,
+        offering_id=offering_id,
+        happening_id=happening_id,
+        start_at=start_at,
+        end_at=source_row.get("end_at"),
+        counts=counts,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -804,6 +1136,8 @@ def run_merge_loop(
     environment: str | None = None,
     include_needs_review: bool = False,
     persist_run_stats: bool = True,
+    max_batches: int | None = None,
+    max_rows: int | None = None,
 ) -> dict[str, int]:
     run_id = str(uuid4())
 
@@ -818,6 +1152,11 @@ def run_merge_loop(
         "canonical_updates": 0,
         "history_rows": 0,
         "dedupe_fast_path": 0,
+        # Phase 10: collision-proofing counters
+        "offering_nk_reused": 0,
+        "occurrence_conflict_reused": 0,
+        "occurrence_null_start_skipped": 0,
+        "reviews_created": 0,
     }
 
     # Per-source breakdown for observability (Phase 7)
@@ -830,6 +1169,16 @@ def run_merge_loop(
     # Confidence telemetry (Phase 9)
     telemetry = ConfidenceTelemetry()
 
+    # Dry-mode seen set: track fetched ids to avoid infinite re-fetching.
+    # In live mode the claim mechanism (status → processing) prevents this.
+    dry_seen_ids: set[str] = set() if dry_run else set()  # always init, only used in dry
+
+    # Resolve effective max_batches: dry defaults to 10 if caller didn't specify.
+    effective_max_batches = max_batches
+    if effective_max_batches is None and dry_run:
+        effective_max_batches = 10
+    batch_count = 0
+
     # --- Run stats: create row at start ---
     stats_run_id: str | None = None
     if persist_run_stats:
@@ -840,18 +1189,48 @@ def run_merge_loop(
 
     try:
         while True:
+            # --- Guard: max_batches ---
+            if effective_max_batches is not None and batch_count >= effective_max_batches:
+                print(f"[merge_loop] reached max_batches={effective_max_batches}, stopping.")
+                break
+
+            # --- Guard: max_rows ---
+            if max_rows is not None and counts["queued"] >= max_rows:
+                print(f"[merge_loop] reached max_rows={max_rows} (processed {counts['queued']}), stopping.")
+                break
+
+            # In dry mode, pass seen ids so we don't re-fetch the same rows.
             rows = fetch_queued_source_happenings(
                 supabase,
                 limit=batch_size,
                 include_needs_review=include_needs_review,
+                exclude_ids=dry_seen_ids if dry_run else None,
             )
 
-            print(f"[merge_loop] fetched_batch={len(rows)} include_needs_review={include_needs_review}")
+            print(f"[merge_loop] fetched_batch={len(rows)} include_needs_review={include_needs_review} batch={batch_count+1}")
 
             if not rows:
                 break
 
+            # --- Safety guard: zero new ids means we're stuck ---
+            new_ids = {str(r.get("id", "")) for r in rows}
+            if dry_run and not (new_ids - dry_seen_ids):
+                print("[merge_loop] WARNING: fetched batch contains 0 new ids, breaking to avoid infinite loop.")
+                break
+
+            # Track seen ids for dry mode pagination
+            if dry_run:
+                dry_seen_ids.update(new_ids)
+
+            # Optionally trim batch if max_rows would be exceeded
+            if max_rows is not None:
+                remaining = max_rows - counts["queued"]
+                if remaining <= 0:
+                    break
+                rows = rows[:remaining]
+
             counts["queued"] += len(rows)
+            batch_count += 1
 
             # Claim rows to avoid infinite refetch loops
             try:
@@ -906,6 +1285,14 @@ def run_merge_loop(
                                 source_row=source_row,
                             ):
                                 counts["canonical_updates"] += 1
+                            # Ensure occurrence exists for this merge
+                            _ensure_occurrence_on_merge(
+                                supabase=supabase,
+                                happening_id=fast_happening_id,
+                                source_row=source_row,
+                                run_id=run_id,
+                                counts=counts,
+                            )
                             mark_source_processed(
                                 supabase=supabase,
                                 source_happening_id=source_id,
@@ -948,9 +1335,11 @@ def run_merge_loop(
                         counts["created"] += 1
                         source_breakdown[src_name]["created"] += 1
                         if not dry_run:
-                            happening_id = create_happening_schedule_occurrence(
+                            happening_id, fully_resolved = create_happening_schedule_occurrence(
                                 supabase=supabase,
                                 source_row=source_row,
+                                run_id=run_id,
+                                counts=counts,
                             )
                             link_happening_source(
                                 supabase=supabase,
@@ -958,14 +1347,23 @@ def run_merge_loop(
                                 source_row=source_row,
                                 is_primary=True,
                             )
-                            mark_source_processed(
-                                supabase=supabase,
-                                source_happening_id=source_id,
-                            )
-                            ignore_open_reviews_for_source_row(
-                                supabase=supabase,
-                                source_happening_id=source_id,
-                            )
+                            if fully_resolved:
+                                mark_source_processed(
+                                    supabase=supabase,
+                                    source_happening_id=source_id,
+                                )
+                                ignore_open_reviews_for_source_row(
+                                    supabase=supabase,
+                                    source_happening_id=source_id,
+                                )
+                            else:
+                                # Offering/occurrence had unresolvable constraint
+                                # violation — review was already logged; mark
+                                # source row needs_review so it stays visible.
+                                mark_source_needs_review(
+                                    supabase=supabase,
+                                    source_happening_id=source_id,
+                                )
                         continue
 
                     if decision.kind == "merge":
@@ -1013,6 +1411,14 @@ def run_merge_loop(
                                 source_row=source_row,
                             ):
                                 counts["canonical_updates"] += 1
+                            # Ensure occurrence exists for this merge
+                            _ensure_occurrence_on_merge(
+                                supabase=supabase,
+                                happening_id=decision.best_happening_id,
+                                source_row=source_row,
+                                run_id=run_id,
+                                counts=counts,
+                            )
                             mark_source_processed(
                                 supabase=supabase,
                                 source_happening_id=source_id,
@@ -1060,6 +1466,10 @@ def run_merge_loop(
                         errors=counts["errors"],
                         canonical_updates_count=counts["canonical_updates"],
                         history_rows_created=counts["history_rows"],
+                        offering_nk_reused=counts["offering_nk_reused"],
+                        occurrence_conflict_reused=counts["occurrence_conflict_reused"],
+                        occurrence_null_start_skipped=counts["occurrence_null_start_skipped"],
+                        reviews_created=counts["reviews_created"],
                     ),
                     source_breakdown=dict(source_breakdown) if source_breakdown else None,
                     stage_timings_ms=stage_timings if stage_timings else None,
@@ -1152,6 +1562,18 @@ def main() -> None:
     )
     parser.add_argument("--code-version", type=str, default=None)
     parser.add_argument("--environment", type=str, default=None)
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Max number of batches to process (default: 10 for dry, unlimited for live).",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Max total source rows to process across all batches.",
+    )
 
     args = parser.parse_args()
 
@@ -1165,11 +1587,15 @@ def main() -> None:
         code_version=args.code_version,
         environment=args.environment,
         include_needs_review=bool(args.include_needs_review),
+        max_batches=args.max_batches,
+        max_rows=args.max_rows,
     )
 
     mode = "DRY RUN" if dry_run else "LIVE"
     print(
-        f"[merge_loop] mode={mode} batch_size={args.batch_size} include_needs_review={args.include_needs_review}"
+        f"[merge_loop] mode={mode} batch_size={args.batch_size} "
+        f"include_needs_review={args.include_needs_review} "
+        f"max_batches={args.max_batches} max_rows={args.max_rows}"
     )
     print(f"[merge_loop] counts={counts}")
 
