@@ -8,6 +8,9 @@ per-source breakdown (JSONB), and stage timing (JSONB).
 
 Phase 9: expanded with confidence telemetry (min/avg/max, histogram,
 per-source confidence).
+
+Phase 10: expanded with collision-proofing counters (offering_nk_reused,
+occurrence_conflict_reused, occurrence_null_start_skipped, reviews_created).
 """
 from __future__ import annotations
 
@@ -31,6 +34,11 @@ class MergeRunCounters:
     errors: int = 0
     canonical_updates_count: int = 0
     history_rows_created: int = 0
+    # Phase 10: collision-proofing counters
+    offering_nk_reused: int = 0
+    occurrence_conflict_reused: int = 0
+    occurrence_null_start_skipped: int = 0
+    reviews_created: int = 0
 
 
 def create_merge_run(supabase: Client) -> str:
@@ -66,6 +74,10 @@ def finish_merge_run(
         "errors": counters.errors,
         "canonical_updates_count": counters.canonical_updates_count,
         "history_rows_created": counters.history_rows_created,
+        "offering_nk_reused": counters.offering_nk_reused,
+        "occurrence_conflict_reused": counters.occurrence_conflict_reused,
+        "occurrence_null_start_skipped": counters.occurrence_null_start_skipped,
+        "reviews_created": counters.reviews_created,
     }
     if source_breakdown is not None:
         payload["source_breakdown"] = source_breakdown

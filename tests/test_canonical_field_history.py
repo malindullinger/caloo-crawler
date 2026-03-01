@@ -316,6 +316,7 @@ def test_update_happening_on_merge_noop_when_same():
         "title": "Kinderyoga im Park",
         "description": "Spass für Kinder",
         "visibility_status": "draft",
+        "canonical_dedupe_key": "c1|existing",  # already has key → no backfill
     }
     happening_builder = MagicMock()
     for method in [

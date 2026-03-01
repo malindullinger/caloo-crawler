@@ -203,7 +203,7 @@ def test_create_happening_includes_audience_tags():
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW)
 
     # First insert call is the happening payload
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "audience_tags" in happening_payload
     assert "family_kids" in happening_payload["audience_tags"]
 
@@ -216,7 +216,7 @@ def test_create_happening_includes_topic_tags():
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=source)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "topic_tags" in happening_payload
     assert "sport" in happening_payload["topic_tags"]
     assert "nature" in happening_payload["topic_tags"]
@@ -233,7 +233,7 @@ def test_create_happening_omits_empty_tags():
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=source)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "audience_tags" not in happening_payload
     assert "topic_tags" not in happening_payload
 

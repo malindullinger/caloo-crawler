@@ -126,11 +126,63 @@ existing drafts; the code now defaults to `"published"`.
   gating, or manual approval queues.
 - Until then, `"published"` is the only correct default.
 
+**Update (2026-02-26):**
+The pipeline no longer explicitly sets `visibility_status`. The DB column
+default (`'published'`) handles new rows. This prevents the pipeline from
+overwriting admin visibility decisions on upsert. The test
+`test_create_sets_visibility_published` was replaced by
+`test_create_does_not_set_visibility_status`.
+
 **Files:**
-- `src/canonicalize/merge_loop.py` line 498 — sets the default
+- `src/canonicalize/merge_loop.py` — uses DB default (no explicit visibility_status)
 - `migrations/021_publish_draft_happenings.sql` — one-time fix for existing drafts
-- `tests/test_canonical_field_invariants.py` — `test_create_sets_visibility_published`
+- `tests/test_canonical_field_invariants.py` — `test_create_does_not_set_visibility_status`
 - `tests/test_source_to_canonical_chain.py` — regression tests
+
+---
+
+## Decision: canonical_dedupe_key — DB-enforced canonical identity
+
+**Date:** 2026-02-26
+
+**Context:**
+Duplicate canonical happenings representing the same real-world event were
+being created when the fuzzy scoring path disagreed across runs, or when
+multiple sources with slight title variations triggered independent CREATE
+decisions. This is a data integrity problem that cannot be solved purely at
+the application layer.
+
+**Solution:**
+Add a deterministic `canonical_dedupe_key` column to `public.happening`,
+enforced by a unique partial index. The key is computed from:
+
+```
+c1|sha256(happening_kind | normalized_title | date_anchor | location_anchor)
+```
+
+**Key contract (c1):**
+- `happening_kind`: event / activity / course / service (default: event)
+- `normalized_title`: lowercase, collapse whitespace, strip punctuation
+- `date_anchor`: start_date if present, else start_at→date (Europe/Zurich), else 'unknown-date'
+- `location_anchor`: primary_venue_id if present, else 'online', else 'unknown-location'
+- Prefix `c1|` distinguishes canonical keys from source-level `v1|` keys
+
+**Pipeline behavior:**
+- `create_happening_schedule_occurrence` uses upsert on `canonical_dedupe_key`
+- `update_happening_on_merge` backfills `canonical_dedupe_key` on existing rows
+- Editorial fields (`editorial_priority`, `visibility_override`, `override_*`)
+  are **never** written by the pipeline
+- `visibility_status` is **never** set by the pipeline — DB default handles it
+
+**Convergence job:**
+- Groups existing duplicates by `canonical_dedupe_key`
+- Winner: highest editorial_priority > most source links > earliest created_at > lex id
+- Repoints offerings and happening_sources to winner; archives losers
+
+**Files:**
+- Migrations: `20260226110000`, `20260226120000`, `20260226130000`
+- Python: `src/canonicalize/canonical_dedupe_key.py`, `src/jobs/converge_canonical_duplicates.py`
+- Tests: `test_canonical_dedupe_key.py`, `test_editorial_field_protection.py`, `test_convergence_job.py`
 
 ---
 

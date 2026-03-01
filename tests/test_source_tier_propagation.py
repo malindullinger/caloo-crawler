@@ -63,20 +63,21 @@ def test_enqueue_writes_correct_source_tier(source_id: str, expected_tier: str):
     """enqueue_source_happening must write the tier from ev.extra, not hardcode 'A'."""
     from src.storage import enqueue_source_happening
 
-    mock_builder = MagicMock()
-    mock_table = MagicMock(return_value=mock_builder)
-    mock_builder.upsert.return_value = mock_builder
-    mock_builder.execute.return_value = MagicMock(data=[{}])
-
     mock_supabase = MagicMock()
-    mock_supabase.table = mock_table
+    # RPC returns a builder with .execute()
+    rpc_builder = MagicMock()
+    rpc_builder.execute.return_value = MagicMock(data=[{}])
+    mock_supabase.rpc.return_value = rpc_builder
 
     ev = _make_normalized(source_id, expected_tier)
 
     with patch("src.storage.get_supabase", return_value=mock_supabase):
         enqueue_source_happening(ev)
 
-    payload = mock_builder.upsert.call_args[0][0]
+    # enqueue_source_happening calls supabase.rpc("upsert_source_happening_v1", {"p": payload})
+    mock_supabase.rpc.assert_called_once()
+    rpc_args = mock_supabase.rpc.call_args
+    payload = rpc_args[0][1]["p"]  # second positional arg is {"p": payload}
     assert payload["source_tier"] == expected_tier, (
         f"{source_id}: payload source_tier={payload['source_tier']!r}, expected {expected_tier!r}"
     )
@@ -88,13 +89,10 @@ def test_enqueue_defaults_tier_a_when_extra_missing():
     """If extra has no source_tier, storage defaults to 'A'."""
     from src.storage import enqueue_source_happening
 
-    mock_builder = MagicMock()
-    mock_table = MagicMock(return_value=mock_builder)
-    mock_builder.upsert.return_value = mock_builder
-    mock_builder.execute.return_value = MagicMock(data=[{}])
-
     mock_supabase = MagicMock()
-    mock_supabase.table = mock_table
+    rpc_builder = MagicMock()
+    rpc_builder.execute.return_value = MagicMock(data=[{}])
+    mock_supabase.rpc.return_value = rpc_builder
 
     ev = NormalizedEvent(
         external_id="ext-1",
@@ -110,7 +108,7 @@ def test_enqueue_defaults_tier_a_when_extra_missing():
     with patch("src.storage.get_supabase", return_value=mock_supabase):
         enqueue_source_happening(ev)
 
-    payload = mock_builder.upsert.call_args[0][0]
+    payload = mock_supabase.rpc.call_args[0][1]["p"]
     assert payload["source_tier"] == "A"
 
 
@@ -118,20 +116,17 @@ def test_enqueue_defaults_tier_a_for_invalid_value():
     """If extra.source_tier is invalid, storage defaults to 'A'."""
     from src.storage import enqueue_source_happening
 
-    mock_builder = MagicMock()
-    mock_table = MagicMock(return_value=mock_builder)
-    mock_builder.upsert.return_value = mock_builder
-    mock_builder.execute.return_value = MagicMock(data=[{}])
-
     mock_supabase = MagicMock()
-    mock_supabase.table = mock_table
+    rpc_builder = MagicMock()
+    rpc_builder.execute.return_value = MagicMock(data=[{}])
+    mock_supabase.rpc.return_value = rpc_builder
 
     ev = _make_normalized("test_source", "X")  # invalid tier
 
     with patch("src.storage.get_supabase", return_value=mock_supabase):
         enqueue_source_happening(ev)
 
-    payload = mock_builder.upsert.call_args[0][0]
+    payload = mock_supabase.rpc.call_args[0][1]["p"]
     assert payload["source_tier"] == "A"
 
 

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Any, Mapping, Sequence
 
+from src.junk_titles import is_junk_title
+
 
 @dataclass(frozen=True)
 class EligibilityResult:
@@ -109,6 +111,9 @@ def is_feed_eligible(
     title = (_get(happening, "title") or "").strip()
     if not title:
         reasons.append("missing_title")
+
+    if is_junk_title(title):
+        reasons.append("junk_title")
 
     # Date presence: allow either a date-only canonical field OR start_at.
     # Prefer "start_date_local" or "start_date" if those exist on canonical.

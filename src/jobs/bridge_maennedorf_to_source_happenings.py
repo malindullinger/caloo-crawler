@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from supabase import Client, create_client
 
 # Centralized upsert (dedupe_key derivation + on_conflict="source_id,dedupe_key")
+from src.junk_titles import is_junk_title
 from src.storage import upsert_source_happening_row
 
 
@@ -79,6 +80,16 @@ def _extract_image_url(extra: Any) -> Optional[str]:
     return None
 
 
+def _extract_organizer_name(extra: Any) -> Optional[str]:
+    if not isinstance(extra, dict):
+        return None
+    name = extra.get("organizer_name")
+    if isinstance(name, str):
+        name = name.strip()
+        return name or None
+    return None
+
+
 def _safe_status(s: Any) -> str:
     return (s or "").strip().lower()
 
@@ -95,19 +106,45 @@ SOURCE_TIER = "B"
 DO_NOT_TOUCH = {"processed", "ignored"}
 
 
+_COLS_WITH_EXTRA = (
+    "external_id,source_id,title,start_at,end_at,timezone,"
+    "location_name,description,canonical_url,last_seen_at,image_url,extra"
+)
+_COLS_WITHOUT_EXTRA = (
+    "external_id,source_id,title,start_at,end_at,timezone,"
+    "location_name,description,canonical_url,last_seen_at,image_url"
+)
+
+
 def _fetch_events(supabase: Client, *, limit: int) -> List[Dict[str, Any]]:
-    # Reads from normalized events table (your pipeline writes here)
-    resp = (
-        supabase.table("events")
-        .select(
-            "external_id,source_id,title,start_at,end_at,timezone,location_name,description,canonical_url,last_seen_at"
+    """
+    Read from public.events. Try selecting with extra first;
+    if PostgREST returns 42703 (undefined column), retry without it.
+    """
+    try:
+        resp = (
+            supabase.table("events")
+            .select(_COLS_WITH_EXTRA)
+            .eq("source_id", SOURCE_ID)
+            .order("last_seen_at", desc=True)
+            .limit(limit)
+            .execute()
         )
-        .eq("source_id", SOURCE_ID)
-        .order("last_seen_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    return resp.data or []
+        return resp.data or []
+    except Exception as e:
+        err_str = str(e)
+        if "42703" in err_str:
+            print("[bridge] events.extra column not found (42703), retrying without it")
+            resp = (
+                supabase.table("events")
+                .select(_COLS_WITHOUT_EXTRA)
+                .eq("source_id", SOURCE_ID)
+                .order("last_seen_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return resp.data or []
+        raise
 
 
 def _get_existing_status_by_external_id(
@@ -165,7 +202,12 @@ def bridge(*, supabase: Client, live: bool, limit: int) -> None:
         location_raw = ev.get("location_name")
         tz = ev.get("timezone") or "Europe/Zurich"
 
-        image_url = _extract_image_url(ev.get("extra"))
+        # image_url: prefer events.image_url column, fallback to extra.image_url
+        extra = ev.get("extra") if "extra" in ev else None
+        raw_image = ev.get("image_url")
+        image_url = (raw_image.strip() if isinstance(raw_image, str) and raw_image.strip() else None) or _extract_image_url(extra)
+        # organizer_name: only set when extra exists and contains it
+        organizer_name = _extract_organizer_name(extra)
 
         start_at = _to_iso(ev.get("start_at"))
         end_at = _to_iso(ev.get("end_at"))
@@ -190,6 +232,7 @@ def bridge(*, supabase: Client, live: bool, limit: int) -> None:
             "start_date_local": None,
             "end_date_local": None,
             "image_url": image_url,
+            "organizer_name": organizer_name,
             "status": "needs_review",  # safe default; merge_loop can process with flag
             "fetched_at": _to_iso(ev.get("last_seen_at")) or now_utc.isoformat(),
             "updated_at": now_utc.isoformat(),
@@ -203,6 +246,26 @@ def bridge(*, supabase: Client, live: bool, limit: int) -> None:
         print(
             f"[bridge] DRY RUN: would upsert {len(rows)} terminal_skipped={terminal_skipped}"
         )
+        if events:
+            sample = next(
+                (
+                    e for e in events
+                    if isinstance(e.get("title"), str)
+                    and not is_junk_title(e["title"])
+                    and (e.get("canonical_url") or "").strip()
+                ),
+                events[0],
+            )
+            raw_extra = sample.get("extra") if "extra" in sample else None
+            if "extra" not in sample:
+                extra_info = "extra: <column missing>"
+            elif raw_extra is None:
+                extra_info = "extra: null"
+            elif isinstance(raw_extra, dict):
+                extra_info = f"extra keys: {sorted(raw_extra.keys())}"
+            else:
+                extra_info = f"extra: <{type(raw_extra).__name__}>"
+            print(f"[bridge][debug] {extra_info} | image_url={sample.get('image_url')} | title={sample.get('title')}")
         return
 
     upserted = 0

@@ -6,10 +6,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
+
+from src.junk_titles import is_junk_title
 
 from ..base import BaseAdapter
 from ..http import http_get
@@ -23,6 +25,111 @@ _IWEB_IMG_RE = re.compile(
     r"(https?:\/\/api\.i-web\.ch\/public\/guest\/getImageString\/[^\s\"'>]+)",
     re.IGNORECASE,
 )
+
+_ATTACHMENT_EXT_RE = re.compile(r"\.(pdf|jpe?g|png)$", re.IGNORECASE)
+
+_ORGANIZER_LABEL_RE = re.compile(
+    r"^(Veranstalter|Organisator|Organisation)\s*:\s*",
+    re.IGNORECASE,
+)
+
+_LOGIN_MARKER = "LOGIN mit Benutzerkonto"
+
+
+def _is_login_overlay(soup: BeautifulSoup) -> bool:
+    """Return True if the page contains a login overlay blocking real content."""
+    body = soup.body
+    if not body:
+        return False
+    text = body.get_text(" ", strip=True)
+    return _LOGIN_MARKER in text
+
+
+def _extract_attachment_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
+    """Extract URLs of linked PDF/JPEG/PNG attachments from anchor tags."""
+    urls: List[str] = []
+    seen: set[str] = set()
+    container = soup.select_one("main") or soup.select_one("article") or soup
+    for a in container.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        # Check extension on path portion only (ignore query params)
+        path = href.split("?")[0].split("#")[0]
+        if not _ATTACHMENT_EXT_RE.search(path):
+            continue
+        abs_url = urljoin(base_url, href)
+        if abs_url not in seen:
+            seen.add(abs_url)
+            urls.append(abs_url)
+    return urls
+
+
+def _extract_outbound_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
+    """Extract external outbound links (different host from the detail page)."""
+    try:
+        base_host = urlparse(base_url).hostname or ""
+    except Exception:
+        return []
+    urls: List[str] = []
+    seen: set[str] = set()
+    container = soup.select_one("main") or soup.select_one("article") or soup
+    for a in container.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
+            continue
+        abs_url = urljoin(base_url, href)
+        try:
+            link_host = urlparse(abs_url).hostname or ""
+        except Exception:
+            continue
+        if not link_host or link_host == base_host:
+            continue
+        if abs_url not in seen:
+            seen.add(abs_url)
+            urls.append(abs_url)
+    return urls
+
+
+def _extract_organizer_name(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Extract organizer name from explicit label patterns:
+    'Veranstalter: X', 'Organisator: X', 'Organisation: X'
+
+    Searches both in text nodes and structured label/value pairs (dt/dd, th/td).
+    """
+    # Strategy 1: Scan all text lines for "Label: Value" pattern
+    container = soup.select_one("main") or soup.select_one("article") or soup
+    text = container.get_text("\n", strip=True)
+    for line in text.split("\n"):
+        line = line.strip()
+        m = _ORGANIZER_LABEL_RE.match(line)
+        if m:
+            value = line[m.end():].strip()
+            if value:
+                return value
+
+    # Strategy 2: <dt>Veranstalter</dt><dd>Name</dd> pattern
+    for dt in container.select("dt"):
+        label = (dt.get_text(strip=True) or "").strip().rstrip(":")
+        if label.lower() in ("veranstalter", "organisator", "organisation"):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                value = dd.get_text(strip=True).strip()
+                if value:
+                    return value
+
+    # Strategy 3: <th>Veranstalter</th><td>Name</td> pattern
+    for th in container.select("th"):
+        label = (th.get_text(strip=True) or "").strip().rstrip(":")
+        if label.lower() in ("veranstalter", "organisator", "organisation"):
+            td = th.find_next_sibling("td")
+            if td:
+                value = td.get_text(strip=True).strip()
+                if value:
+                    return value
+
+    return None
 
 
 def _normalize_datetime_text(raw: str) -> str:
@@ -49,10 +156,8 @@ def _normalize_datetime_text(raw: str) -> str:
 
 
 def _is_junk_title(title: str) -> bool:
-    t = (title or "").strip().lower()
-    if not t:
-        return True
-    return t in ("kopfzeile", "fusszeile") or t.startswith("kopfzeile") or t.startswith("fusszeile")
+    """Adapter-local alias for the shared predicate."""
+    return is_junk_title(title)
 
 
 def _is_non_event_target_url(url: str) -> bool:
@@ -175,6 +280,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
             "skip_junk_title": 0,
             "skip_no_datetime": 0,
             "skip_sitzung": 0,
+            "skip_login_overlay": 0,
             "skip_non_event_target_before_js": 0,
             "detail_parse_failed": 0,
             "js_fallback_used": 0,
@@ -278,8 +384,8 @@ class MaennedorfPortalAdapter(BaseAdapter):
             delta1["skip_non_event_target_before_js"] = delta1.get("skip_non_event_target_before_js", 0) + 1
             return _DetailResult(item=None, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
 
-        # If it was a sitzung skip, don't retry with JS.
-        if delta1.get("skip_sitzung", 0) > 0:
+        # If it was a sitzung or login overlay skip, don't retry with JS.
+        if delta1.get("skip_sitzung", 0) > 0 or delta1.get("skip_login_overlay", 0) > 0:
             return _DetailResult(item=None, stats_delta=delta1, used_js=False, fetch_seconds=(t1 - t0))
 
         # Skip pages without .icms-lead-container — non-event pages where JS cannot help.
@@ -338,10 +444,16 @@ class MaennedorfPortalAdapter(BaseAdapter):
             "skip_junk_title": 0,
             "skip_no_datetime": 0,
             "skip_sitzung": 0,
+            "skip_login_overlay": 0,
             "detail_parse_failed": 0,
         }
 
         soup = BeautifulSoup(html or "", "html.parser")
+
+        # ---- Login overlay detection ----
+        if _is_login_overlay(soup):
+            delta["skip_login_overlay"] += 1
+            return None, delta
 
         # If platform redirects to /sitzung/, skip entirely
         try:
@@ -497,18 +609,35 @@ class MaennedorfPortalAdapter(BaseAdapter):
             txt = main2.get_text(" ", strip=True)
             description_raw = txt[:2000] if txt else None
 
+        # ---- Attachments (PDF/JPEG/PNG links) ----
+        attachment_urls = _extract_attachment_urls(soup, final_url)
+
+        # ---- Outbound URLs (external links) ----
+        outbound_urls = _extract_outbound_urls(soup, final_url)
+
+        # ---- Organizer name ----
+        organizer_name = _extract_organizer_name(soup)
+
+        extra: Dict[str, Any] = {
+            "adapter": "maennedorf_portal",
+            "detail_parsed": True,
+            "extraction_method": extraction_method,
+            "image_url": image_url,
+        }
+        if attachment_urls:
+            extra["attachment_urls"] = attachment_urls
+        if outbound_urls:
+            extra["outbound_urls"] = outbound_urls
+        if organizer_name:
+            extra["organizer_name"] = organizer_name
+
         item = ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,
             location_raw=location_raw,
             description_raw=description_raw,
             item_url=final_url,
-            extra={
-                "adapter": "maennedorf_portal",
-                "detail_parsed": True,
-                "extraction_method": extraction_method,
-                "image_url": image_url,
-            },
+            extra=extra,
             fetched_at=getattr(cfg, "now_utc", None),
         )
         return item, delta

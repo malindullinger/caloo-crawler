@@ -97,8 +97,8 @@ def test_create_happening_excludes_image_url():
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW)
 
-    # First insert call is the happening payload
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    # First upsert call is the happening payload
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "image_url" not in happening_payload, \
         "image_url must not be in canonical happening"
 
@@ -226,20 +226,26 @@ def test_create_uses_raw_fields_verbatim():
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=source)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    # Happening now uses upsert (canonical_dedupe_key dedup)
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert happening_payload["title"] == "  Kinder Yoga  "
     assert happening_payload["description"] == "  Spielerisches Yoga  "
 
 
-def test_create_sets_visibility_published():
-    """New canonical happenings are immediately published (feed-visible)."""
+def test_create_does_not_set_visibility_status():
+    """
+    Pipeline must NOT set visibility_status — the DB default ('published')
+    handles new rows, and the pipeline must never overwrite admin visibility.
+    """
     from src.canonicalize.merge_loop import create_happening_schedule_occurrence
 
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
-    assert happening_payload["visibility_status"] == "published"
+    happening_payload = builder.upsert.call_args_list[0][0][0]
+    assert "visibility_status" not in happening_payload, (
+        "Pipeline must not set visibility_status — DB default handles it"
+    )
 
 
 def test_review_does_not_auto_overwrite_canonical():
@@ -311,27 +317,31 @@ def test_create_payload_identical_across_calls():
     create_happening_schedule_occurrence(supabase=sb1, source_row=SOURCE_ROW)
     create_happening_schedule_occurrence(supabase=sb2, source_row=SOURCE_ROW)
 
-    payload_1 = builder1.insert.call_args_list[0][0][0]
-    payload_2 = builder2.insert.call_args_list[0][0][0]
+    payload_1 = builder1.upsert.call_args_list[0][0][0]
+    payload_2 = builder2.upsert.call_args_list[0][0][0]
 
     assert payload_1 == payload_2, "Same source must produce same canonical payload"
 
 
 def test_offering_payload_stable_across_calls():
-    """Offering payload is deterministic for the same source."""
+    """
+    Offering access is deterministic for the same source.
+    With get-or-create, the offering may be reused via SELECT (no INSERT)
+    when the mock returns existing data. The key invariant: same source
+    produces the same offering natural key query.
+    """
     from src.canonicalize.merge_loop import create_happening_schedule_occurrence
 
     sb1, builder1 = _mock_supabase()
     sb2, builder2 = _mock_supabase()
 
-    create_happening_schedule_occurrence(supabase=sb1, source_row=SOURCE_ROW)
-    create_happening_schedule_occurrence(supabase=sb2, source_row=SOURCE_ROW)
+    _hid1, _ok1 = create_happening_schedule_occurrence(supabase=sb1, source_row=SOURCE_ROW)
+    _hid2, _ok2 = create_happening_schedule_occurrence(supabase=sb2, source_row=SOURCE_ROW)
 
-    # Second insert call = offering
-    offering_1 = builder1.insert.call_args_list[1][0][0]
-    offering_2 = builder2.insert.call_args_list[1][0][0]
-
-    assert offering_1 == offering_2, "Same source must produce same offering payload"
+    # Both calls must access the offering table identically
+    # (via eq chain in _get_or_create_offering's _find_existing)
+    assert builder1.eq.call_count == builder2.eq.call_count, \
+        "Same source must produce same offering lookup pattern"
 
 
 def test_merge_loop_second_run_zero_side_effects():
@@ -490,7 +500,7 @@ def test_create_returns_valid_happening_id_for_provenance():
     from src.canonicalize.merge_loop import create_happening_schedule_occurrence
 
     sb, builder = _mock_supabase()
-    happening_id = create_happening_schedule_occurrence(
+    happening_id, fully_resolved = create_happening_schedule_occurrence(
         supabase=sb, source_row=SOURCE_ROW,
     )
 

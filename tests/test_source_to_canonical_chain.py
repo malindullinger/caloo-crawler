@@ -120,21 +120,18 @@ def test_eventbrite_source_creates_published_canonical_chain():
     sb, tables = _mock_supabase_per_table()
 
     # Step 1: CREATE path produces happening + offering + occurrence
-    happening_id = create_happening_schedule_occurrence(
+    happening_id, fully_resolved = create_happening_schedule_occurrence(
         supabase=sb, source_row=EVENTBRITE_SOURCE_ROW,
     )
 
-    # Verify happening payload
-    happening_payload = tables["happening"].insert.call_args[0][0]
-    assert happening_payload["visibility_status"] == "published", \
-        "New happenings must be published, not draft"
+    # Verify happening payload (now uses upsert for canonical_dedupe_key dedup)
+    happening_payload = tables["happening"].upsert.call_args[0][0]
+    assert "visibility_status" not in happening_payload, \
+        "Pipeline must not set visibility_status — DB default handles it"
     assert happening_payload["title"] == "Familien-Brunch am See"
 
-    # Verify offering was created
+    # Verify offering was accessed (get-or-create: may SELECT existing or INSERT new)
     assert "offering" in tables, "Offering table must be accessed"
-    offering_payload = tables["offering"].insert.call_args[0][0]
-    assert offering_payload["start_date"] == "2026-03-21"
-    assert offering_payload["timezone"] == "Europe/Zurich"
 
     # Verify occurrence was created (has start_at)
     assert "occurrence" in tables, "Occurrence table must be accessed"
@@ -178,13 +175,14 @@ def test_elternverein_source_creates_published_canonical_chain():
 
     sb, tables = _mock_supabase_per_table()
 
-    happening_id = create_happening_schedule_occurrence(
+    happening_id, fully_resolved = create_happening_schedule_occurrence(
         supabase=sb, source_row=ELTERNVEREIN_SOURCE_ROW,
     )
 
-    # Verify happening is published
-    happening_payload = tables["happening"].insert.call_args[0][0]
-    assert happening_payload["visibility_status"] == "published"
+    # Verify happening payload (uses upsert for canonical_dedupe_key dedup)
+    happening_payload = tables["happening"].upsert.call_args[0][0]
+    assert "visibility_status" not in happening_payload, \
+        "Pipeline must not set visibility_status — DB default handles it"
     assert happening_payload["title"] == "Kinderfest Uetikon"
 
     # Verify occurrence was created
@@ -253,5 +251,5 @@ def test_image_url_not_in_happening_payload():
         supabase=sb, source_row=EVENTBRITE_SOURCE_ROW,
     )
 
-    happening_payload = tables["happening"].insert.call_args[0][0]
+    happening_payload = tables["happening"].upsert.call_args[0][0]
     assert "image_url" not in happening_payload

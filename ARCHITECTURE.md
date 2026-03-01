@@ -46,6 +46,7 @@ Responsibilities:
 - Audience
 - Organizer
 - Visibility status
+- `canonical_dedupe_key` — deterministic identity key (`c1|sha256(...)`)
 
 Explicitly does **not** contain:
 - dates
@@ -53,8 +54,13 @@ Explicitly does **not** contain:
 - recurrence
 - venues
 
-> **Invariant:**  
+> **Invariant:**
 > Time and date must never live on `happening`.
+
+> **Invariant (canonical identity):**
+> `canonical_dedupe_key` is unique across all non-archived happenings.
+> The pipeline uses upsert on this key to prevent duplicate canonicals.
+> Editorial fields are never written by the pipeline.
 
 ---
 

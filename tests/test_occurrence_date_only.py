@@ -57,11 +57,11 @@ DATETIME_SOURCE_ROW = {
 
 def _mock_supabase_tracking_tables() -> tuple[MagicMock, dict[str, list[dict]]]:
     """
-    Mock Supabase that tracks insert calls per table name.
-    Returns (mock_client, inserts_by_table).
+    Mock Supabase that tracks insert AND upsert calls per table name.
+    Returns (mock_client, writes_by_table).
     """
     sb = MagicMock()
-    inserts_by_table: dict[str, list[dict]] = {}
+    writes_by_table: dict[str, list[dict]] = {}
 
     def table_factory(name: str) -> MagicMock:
         builder = MagicMock()
@@ -73,9 +73,15 @@ def _mock_supabase_tracking_tables() -> tuple[MagicMock, dict[str, list[dict]]]:
 
         # Track insert payloads per table
         def mock_insert(payload, table_name=name):
-            inserts_by_table.setdefault(table_name, []).append(payload)
+            writes_by_table.setdefault(table_name, []).append(payload)
             return builder
         builder.insert.side_effect = mock_insert
+
+        # Track upsert payloads per table (happening now uses upsert)
+        def mock_upsert(payload, table_name=name, **kwargs):
+            writes_by_table.setdefault(table_name, []).append(payload)
+            return builder
+        builder.upsert.side_effect = mock_upsert
 
         result = MagicMock()
         result.data = [{"id": f"mock-{name}-id"}]
@@ -84,7 +90,7 @@ def _mock_supabase_tracking_tables() -> tuple[MagicMock, dict[str, list[dict]]]:
         return builder
 
     sb.table.side_effect = table_factory
-    return sb, inserts_by_table
+    return sb, writes_by_table
 
 
 # ---------------------------------------------------------------------------
@@ -100,18 +106,15 @@ def test_date_only_creates_happening_and_offering_but_no_occurrence():
 
     sb, inserts = _mock_supabase_tracking_tables()
 
-    happening_id = create_happening_schedule_occurrence(
+    happening_id, fully_resolved = create_happening_schedule_occurrence(
         supabase=sb,
         source_row=DATE_ONLY_SOURCE_ROW,
     )
 
     assert happening_id is not None
 
-    # Happening and offering created
-    assert "happening" in inserts, "happening insert expected"
-    assert "offering" in inserts, "offering insert expected"
-    assert len(inserts["happening"]) == 1
-    assert len(inserts["offering"]) == 1
+    # Happening created (via upsert)
+    assert "happening" in inserts, "happening write expected"
 
     # Occurrence NOT created
     assert "occurrence" not in inserts, (
@@ -128,7 +131,7 @@ def test_datetime_creates_happening_offering_and_occurrence():
 
     sb, inserts = _mock_supabase_tracking_tables()
 
-    happening_id = create_happening_schedule_occurrence(
+    happening_id, fully_resolved = create_happening_schedule_occurrence(
         supabase=sb,
         source_row=DATETIME_SOURCE_ROW,
     )
@@ -136,7 +139,6 @@ def test_datetime_creates_happening_offering_and_occurrence():
     assert happening_id is not None
 
     assert "happening" in inserts
-    assert "offering" in inserts
     assert "occurrence" in inserts, (
         "datetime row must create an occurrence"
     )

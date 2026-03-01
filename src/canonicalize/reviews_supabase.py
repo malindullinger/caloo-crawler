@@ -114,6 +114,48 @@ def write_ambiguous_match_review(
     ).eq("review_type", review_type).eq("status", "open").execute()
 
 
+def write_constraint_violation_review(
+    *,
+    supabase: Client,
+    run_id: str,
+    source_happening_id: str,
+    source_id: str,
+    fingerprint: str,
+    constraint_name: str,
+    details: dict[str, Any],
+) -> bool:
+    """
+    Record a constraint violation as a canonicalization_review.
+
+    Uses the partial unique index on (fingerprint) WHERE status='open'
+    for idempotency: if a review with this fingerprint is already open,
+    this is a no-op.
+
+    Returns True if a review was created, False if it already existed.
+    """
+    insert_payload: dict[str, Any] = {
+        "run_id": run_id,
+        "review_type": "constraint_violation",
+        "status": "open",
+        "source_happening_id": source_happening_id,
+        "source_id": source_id,
+        "fingerprint": fingerprint,
+        "details": {
+            "constraint": constraint_name,
+            **details,
+        },
+    }
+
+    try:
+        supabase.table("canonicalization_reviews").insert(insert_payload).execute()
+        return True
+    except APIError as e:
+        err = _extract_postgrest_error(e)
+        if _is_duplicate_open_review(err):
+            return False
+        raise
+
+
 def mark_source_needs_review(
     *,
     supabase: Client,

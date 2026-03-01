@@ -206,7 +206,7 @@ def test_create_happening_includes_relevance_score_for_family():
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW_FAMILY)
 
     # First insert call is the happening payload
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "relevance_score_global" in happening_payload
     assert happening_payload["relevance_score_global"] == 60  # family_kids(50) + sport/yoga(10)
 
@@ -217,7 +217,7 @@ def test_create_happening_includes_negative_score_for_seniors():
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW_SENIORS)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "relevance_score_global" in happening_payload
     assert happening_payload["relevance_score_global"] == -30  # seniors
 
@@ -229,7 +229,7 @@ def test_create_happening_omits_zero_score():
     sb, builder = _mock_supabase()
     create_happening_schedule_occurrence(supabase=sb, source_row=SOURCE_ROW_NEUTRAL)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     assert "relevance_score_global" not in happening_payload
 
 
@@ -250,7 +250,7 @@ def test_create_happening_score_matches_tag_inference():
     )
     expected_score = compute_relevance_score(audience, topic)
 
-    happening_payload = builder.insert.call_args_list[0][0][0]
+    happening_payload = builder.upsert.call_args_list[0][0][0]
     actual_score = happening_payload.get("relevance_score_global", 0)
     assert actual_score == expected_score
 

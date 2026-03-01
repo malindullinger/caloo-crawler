@@ -10,12 +10,11 @@ from typing import Any, Dict, Optional
 import pytz
 
 from src.db import get_supabase  # adjust if your helper differs
+from src.junk_titles import is_junk_title
 
 
 TZ_NAME = "Europe/Zurich"
 TZ = pytz.timezone(TZ_NAME)
-
-SKIP_TITLES_EXACT = {"Kopfzeile"}
 
 
 def _clean(s: Optional[str]) -> Optional[str]:
@@ -23,15 +22,6 @@ def _clean(s: Optional[str]) -> Optional[str]:
         return None
     s = s.strip()
     return s or None
-
-
-def should_skip_title(title: Optional[str]) -> bool:
-    t = (title or "").strip()
-    if not t:
-        return True
-    if t in SKIP_TITLES_EXACT:
-        return True
-    return False
 
 
 def sha32(text: str) -> str:
@@ -98,7 +88,7 @@ def main() -> None:
 
     for e in rows:
         title_raw = _clean(e.get("title")) or _clean(e.get("title_raw"))
-        if should_skip_title(title_raw):
+        if is_junk_title(title_raw):
             skipped += 1
             continue
 
