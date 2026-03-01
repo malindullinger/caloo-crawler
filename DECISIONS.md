@@ -206,3 +206,15 @@ This prevents silent data drift and enforces responsible recommendation standard
 This decision locks the Feed Integrity Layer contract before implementation.
 
 ---
+
+### 2026-03-01 — Schema Authority Delegated to caloo
+
+**Decision:**
+Database schema mutations are no longer allowed in caloo-crawler.
+
+**Reason:**
+Ensure a single migration history and prevent canonical key constraint drift.
+
+**Impact:**
+- The `supabase/` folder has been removed.
+- This repo now contains ingestion and canonicalization logic only.

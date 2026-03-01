@@ -1,5 +1,9 @@
 # ARCHITECTURE — Caloo Canonicalization System
 
+> **Database schema changes are owned exclusively by the `caloo` repository.**
+> This repository must not contain Supabase migrations.
+> It may only execute against an existing schema.
+
 ## Purpose
 This document defines the **canonical data architecture** for Caloo’s Happenings & Courses ingestion system.
 
