@@ -248,6 +248,46 @@ Test layers:
 
 ---
 
+## Phase 3A — Organizer Extraction Pipeline + NK Governance Stabilization
+
+**Tag:** `v3A-governance-stable`
+
+### Summary
+
+- `OrganizerExtractionPipeline` integrated into adapters (starting with Maennedorf)
+- Deterministic offering natural key (`offering_nk_key`) using SELECT-first + INSERT strategy
+- Occurrence governance switched to INSERT + conflict reuse counter
+- All organizer tests + full suite passing
+
+### What This Guarantees Now
+
+- No duplicate offerings via `offering_nk_key` unique index
+- No silent upsert overwrites
+- Occurrence rows created only when `start_at` is not null
+- Constraint violations always produce explicit reviews
+- Idempotent merge behavior preserved
+- All tests green (643/643)
+
+### What Did NOT Change
+
+- Canonical happening identity model
+- Editorial protection rules
+- Confidence scoring logic
+- Merge decision thresholds
+
+### Known Tradeoffs
+
+- INSERT instead of UPSERT for occurrence (test-aligned + conflict handled manually)
+- SELECT-first pattern may cost 1 extra query per offering but improves determinism
+
+### Next Planned Phase
+
+**Phase 3B — Organizer Identity Canonicalization**
+
+Stable organizer entity, linking, matching, and admin review path.
+
+---
+
 ## Final Note
 
 This architecture intentionally prefers **correct uncertainty** over false certainty.
