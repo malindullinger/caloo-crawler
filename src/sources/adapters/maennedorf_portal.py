@@ -11,12 +11,15 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from src.extraction.organizer import OrganizerExtractionPipeline
 from src.junk_titles import is_junk_title
 
 from ..base import BaseAdapter
 from ..http import http_get
 from ..structured_time import extract_jsonld_event, extract_time_element
 from ..types import SourceConfig, ExtractedItem
+
+_organizer_pipeline = OrganizerExtractionPipeline()
 
 _DETAIL_PATH_RE = re.compile(r"^/(?:_rte/anlass|anlaesseaktuelles)/(\d+)$")
 _ESCAPED_DETAIL_RE = re.compile(r"\\/(?:_rte\\/anlass|anlaesseaktuelles)\\/\d+")
@@ -93,10 +96,11 @@ def _extract_outbound_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
 
 def _extract_organizer_name(soup: BeautifulSoup) -> Optional[str]:
     """
-    Extract organizer name from explicit label patterns:
-    'Veranstalter: X', 'Organisator: X', 'Organisation: X'
+    Extract organizer name from explicit label patterns.
 
-    Searches both in text nodes and structured label/value pairs (dt/dd, th/td).
+    DEPRECATED: Use OrganizerExtractionPipeline instead.
+    Kept temporarily for backward compatibility with existing tests.
+    Will be removed once all adapters migrate to the pipeline.
     """
     # Strategy 1: Scan all text lines for "Label: Value" pattern
     container = soup.select_one("main") or soup.select_one("article") or soup
@@ -615,8 +619,12 @@ class MaennedorfPortalAdapter(BaseAdapter):
         # ---- Outbound URLs (external links) ----
         outbound_urls = _extract_outbound_urls(soup, final_url)
 
-        # ---- Organizer name ----
-        organizer_name = _extract_organizer_name(soup)
+        # ---- Organizer extraction (pipeline) ----
+        org_result = _organizer_pipeline.run(
+            soup=soup,
+            base_url=final_url,
+            outbound_urls=outbound_urls,
+        )
 
         extra: Dict[str, Any] = {
             "adapter": "maennedorf_portal",
@@ -628,8 +636,21 @@ class MaennedorfPortalAdapter(BaseAdapter):
             extra["attachment_urls"] = attachment_urls
         if outbound_urls:
             extra["outbound_urls"] = outbound_urls
-        if organizer_name:
-            extra["organizer_name"] = organizer_name
+        if org_result.winner:
+            extra["organizer_name"] = org_result.winner.name
+            extra["organizer_extraction_confidence"] = org_result.winner.confidence
+            extra["organizer_evidence_type"] = org_result.winner.evidence_type.value
+            extra["organizer_evidence_ref"] = org_result.winner.evidence_ref
+            if org_result.all_candidates:
+                extra["organizer_candidates"] = [
+                    {
+                        "name": c.name,
+                        "confidence": c.confidence,
+                        "evidence_type": c.evidence_type.value,
+                        "evidence_ref": c.evidence_ref,
+                    }
+                    for c in org_result.all_candidates[:3]
+                ]
 
         item = ExtractedItem(
             title_raw=title,

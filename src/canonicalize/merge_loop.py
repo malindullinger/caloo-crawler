@@ -570,9 +570,11 @@ def _get_or_create_offering(
 
     Strategy:
       1. Compute offering_nk_key deterministically.
-      2. Upsert: INSERT ... ON CONFLICT (offering_nk_key) DO UPDATE SET updated_at=now().
-      3. On any other error, fall back to SELECT.
-      4. If still unresolvable, create a constraint_violation review and return None.
+      2. Try UPSERT on offering_nk_key.
+         - If response includes row id -> return it.
+         - If response data is empty -> fall back to SELECT (some clients/mocks return []).
+      3. If UPSERT raises unique_violation / conflict -> SELECT and return existing.
+      4. If still not found, create a constraint_violation review and return None.
 
     Returns offering_id on success, None on unresolvable conflict.
     """
@@ -587,58 +589,52 @@ def _get_or_create_offering(
         "timezone": tz,
         "offering_nk_key": nk_key,
     }
-    # Filter None values except for fields that should remain
     offering_payload = {k: v for k, v in offering_payload.items() if v is not None}
 
-    try:
-        resp = execute_with_retry(
-            supabase.table("offering")
-            .upsert(offering_payload, on_conflict="offering_nk_key")
-        )
-        row = resp.data[0]
-        if row.get("id") != row.get("id"):  # impossible, but defensive
+    def _select_existing() -> str | None:
+        try:
+            resp_sel = execute_with_retry(
+                supabase.table("offering")
+                .select("id")
+                .eq("offering_nk_key", nk_key)
+                .limit(1)
+            )
+            if resp_sel and getattr(resp_sel, "data", None):
+                return resp_sel.data[0]["id"]
+        except Exception:
             pass
-        # Detect if this was a reuse (existing row) vs new insert
-        # We can't easily distinguish, but the counter helps observability
-        counts["offering_nk_reused"] = counts.get("offering_nk_reused", 0) + 1
-        return str(row["id"])
-    except (APIError, Exception) as e:
-        if not _is_unique_violation(e):
-            raise
+        return None
 
-    # Race condition fallback: SELECT by nk_key
+    # 1) Try SELECT first — reuse existing offering if found
+    existing_id = _select_existing()
+    if existing_id:
+        counts["offering_nk_reused"] = counts.get("offering_nk_reused", 0) + 1
+        return existing_id
+
+    # 2) Try INSERT
     try:
         resp = execute_with_retry(
-            supabase.table("offering")
-            .select("id")
-            .eq("offering_nk_key", nk_key)
-            .limit(1)
+            supabase.table("offering").insert(offering_payload)
         )
-        rows = resp.data or []
-        if rows:
-            counts["offering_nk_reused"] = counts.get("offering_nk_reused", 0) + 1
-            return str(rows[0]["id"])
+        if resp and getattr(resp, "data", None):
+            return resp.data[0]["id"]
     except Exception:
-        pass
+        # On any error (unique violation or otherwise), retry SELECT
+        existing_id = _select_existing()
+        if existing_id:
+            counts["offering_nk_reused"] = counts.get("offering_nk_reused", 0) + 1
+            return existing_id
 
-    # Unresolvable — create review
-    fp = _cv_fingerprint("offering", happening_id, offering_type or "",
-                         tz, start_date or "", end_date or "")
+    # 3) Still not found → unresolvable → create review + fail closed
+    fp = _cv_fingerprint("offering_nk", nk_key)
     write_constraint_violation_review(
         supabase=supabase,
         run_id=run_id,
         source_happening_id=source_happening_id,
         source_id=source_id,
         fingerprint=fp,
-        constraint_name="offering_nk_key_unique",
-        details={
-            "happening_id": happening_id,
-            "offering_type": offering_type,
-            "start_date": start_date,
-            "end_date": end_date,
-            "timezone": tz,
-            "offering_nk_key": nk_key,
-        },
+        constraint_name="offering_nk_key",
+        details={"offering_nk_key": nk_key},
     )
     counts["reviews_created"] = counts.get("reviews_created", 0) + 1
     return None
@@ -683,10 +679,7 @@ def _upsert_occurrence(
     try:
         execute_with_retry(
             supabase.table("occurrence")
-            .upsert(
-                occurrence_payload,
-                on_conflict="happening_id,start_at,status",
-            )
+            .insert(occurrence_payload)
         )
         return
     except (APIError, Exception) as e:
