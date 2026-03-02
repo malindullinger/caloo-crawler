@@ -4,13 +4,13 @@
 **All behavior changes must be committed to this repo.**
 
 ### What lives where
-- **GitHub (this repo):** pipeline logic (scrape → normalize → schedules → write to DB)
-- **Supabase:** data storage + *thin* views for consumption (no “business logic” that only exists in SQL)
+- **GitHub (this repo):** canonical identity & ingestion rules in code (scrape → normalize → schedules → write to DB)
+- **Supabase:** data storage + read models (views) and governance guardrails at the write boundary (e.g. publication gating, convergence RPCs). No hidden product logic in UI.
 - **Lovable:** UI only (no hidden rules that change what data means)
 
 ### Rules of thumb
 1. If it changes *what users see* → it must be reproducible from Git.
-2. If a Supabase view is updated → its SQL must be copied into this repo (e.g. `sql/views/...`).
+2. If a Supabase view/function is updated → mirror the SQL in this repo under `sql/` for review/auditability, but the deployed definition lives in caloo migrations (see *Schema Authority Delegated to caloo* below). Mirrors must include the migration filename + commit reference that deployed it.
 3. Lovable should read from a stable view name (e.g. `this_weekend_events`) so the UI doesn’t churn.
 
 
@@ -139,6 +139,12 @@ overwriting admin visibility decisions on upsert. The test
 - `tests/test_canonical_field_invariants.py` — `test_create_does_not_set_visibility_status`
 - `tests/test_source_to_canonical_chain.py` — regression tests
 
+**Update (Phase 3A):**
+- Pipeline may rely on DB defaults for `visibility_status` (still fine).
+- Pipeline must never write `publication_status` via direct `UPDATE`/`UPSERT`.
+- Any `publication_status` transition must go through `set_publication_status` (admin UI and/or automated governance jobs) and is subject to time-truth, open reviews, duplicate fingerprints, provenance, etc.
+- `visibility_status` and `publication_status` are distinct concepts.
+
 ---
 
 ## Decision: canonical_dedupe_key — DB-enforced canonical identity
@@ -204,6 +210,27 @@ confidence_score → ranking modifier
 This prevents silent data drift and enforces responsible recommendation standards.
 
 This decision locks the Feed Integrity Layer contract before implementation.
+
+---
+
+---
+
+## Decision: DB Governance Boundary (Phase 3A)
+
+**Date:** 2026-03-02
+
+All publish/unpublish state transitions go through `set_publication_status`, which enforces:
+- Time-truth consensus gating (no publish if mismatch unresolved)
+- Open canonicalization review checks
+- Duplicate slot fingerprint checks
+- Provenance and junk-title guards
+- Admin auth (`is_admin`)
+
+**Additional governance rules:**
+- Occurrence slot convergence uses RPCs (`admin_converge_duplicate_occurrence_slot_v2`, `admin_converge_all_duplicate_occurrence_slots_v2`)
+- Time-truth is DB-computed consensus (views `time_truth_v1`, `time_truth_status_v1`)
+- The crawler never bypasses these guardrails — it writes raw data; governance lives at the DB boundary
+- Some governance signals are computed in views (time-truth, eligibility/read models), but enforcement happens at write boundaries (publish RPCs, convergence RPCs, constraints)
 
 ---
 

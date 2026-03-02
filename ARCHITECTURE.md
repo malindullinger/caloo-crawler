@@ -15,6 +15,8 @@ Its goals are to:
 
 This document focuses on **how the system is structured and why**, not on UI or implementation details.
 
+> This document started as Phase 1 canonicalization architecture and now includes Phase 3A governance hardening. Phase boundaries remain strict: newer phases may add layers, but may not violate Phase 1 invariants.
+
 ---
 
 ## Core Principles (Non-Negotiable)
@@ -119,6 +121,13 @@ These records:
 - may be invalid, incomplete, or noisy
 - drive all canonicalization decisions
 
+**Quarantine semantics:**
+- A source row is considered quarantined if it is not eligible for downstream consensus computation.
+- Example reasons: `start_at IS NULL`, `status='ignored'`, `error_message IS NOT NULL`.
+- Downstream consumers (especially time-truth) must exclude quarantined rows.
+
+The view definition is the source of truth for the exact quarantine predicate.
+
 ---
 
 #### happening_sources
@@ -182,6 +191,8 @@ This separation is intentional and enforced at the schema level.
 
 > A non-zero `needs_review` set is expected and healthy.
 
+> Note: The architecture outcome `needs_review` is the decision state of canonicalization. The database also tracks review workflow in `canonicalization_reviews` (e.g. `open` → `resolved`), which is the operational queue that admin tooling works against.
+
 ### Meaning of `needs_review`
 A record is in `needs_review` **only if**:
 - multiple real-world interpretations exist, or
@@ -194,12 +205,17 @@ Noise, headers, and invalid rows **must not remain** in `needs_review`.
 
 ## Archived Canonicals
 
-- Archived happenings **must never** be used as match candidates.
-- Archived canonicals must have:
-  - zero offerings
-  - zero source links
+Archived happenings are treated as dead canonicals.
 
-This prevents deadlocks and infinite review loops.
+**Invariants (strong):**
+- Archived happenings must never be used as match candidates.
+- Archived happenings must have:
+  - zero offerings
+  - zero source links (`happening_sources`)
+
+This is enforced by convergence behavior:
+- before archiving a loser, all offerings/occurrences/source links are repointed to the winner
+- only then is the loser archived
 
 ---
 
@@ -211,8 +227,59 @@ Phase 1 is considered complete when:
 - `needs_review` contains only **real-world ambiguity**.
 - No auto-merge performs inference or mutation.
 
-Phase 1 success ≠ zero reviews  
+Phase 1 success ≠ zero reviews
 Phase 1 success = **meaningful reviews only**
+
+---
+
+## Governance Layer (Phase 3A+)
+
+Canonicalization decides **what a Happening is** and links provenance. Governance decides **what is allowed to be visible/published** and prevents integrity regressions.
+
+### Time-Truth (consensus time computation)
+
+We compute a live "consensus start time" from non-quarantined sources and compare it to the canonical occurrence time.
+
+Key DB objects:
+- `time_truth_v1` — consensus computation + deltas
+- `time_truth_status_v1` — mismatch classification (`ok`, `needs_review`, `auto_corrected`, `blocked_publish`, …)
+
+**Invariant:** quarantined source rows must be excluded from consensus computation.
+**Invariant:** time-truth must be deterministic (no duplicate `happening_id` rows).
+
+### Publishing is a gated operation
+
+Publishing is not a direct field update. All publish/unpublish actions go through:
+- `set_publication_status(happening_id, new_status, reason)`
+
+This function enforces non-negotiable guardrails (examples):
+- no open canonicalization reviews
+- no future-occurrence archive
+- no duplicate slot fingerprints among published happenings
+- time-truth mismatch blocks publish
+- admin authorization checks
+
+**Invariant:** The pipeline never writes editorial fields and never publishes directly.
+
+### Occurrence slot convergence (duplicate clusters)
+
+We treat "duplicate slot fingerprints" as an integrity violation that must be resolved before publishing.
+
+Key DB objects:
+- `admin_duplicate_occurrence_slots_v2` — identifies duplicate clusters
+- `admin_converge_duplicate_occurrence_slot_v2(fp)` — merges a single cluster atomically
+- `admin_converge_all_duplicate_occurrence_slots_v2()` — batch merge (fail-closed)
+
+**Invariant:** Convergence archives losers and repoints child records to the winner.
+Losers must end up with zero offerings and zero source links.
+
+### Feed Views are read models (never a source of truth)
+
+Feed surfaces are driven by DB views such as:
+- `feed_occurrences_v1`, `feed_occurrences_ranked_*`, `feed_landing_weekend_*`
+
+**Invariant:** Feed views must only expose `published + eligible + visible` canonicals.
+Archived canonicals must never leak into any feed.
 
 ---
 
