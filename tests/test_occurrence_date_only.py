@@ -106,7 +106,7 @@ def test_date_only_creates_happening_and_offering_but_no_occurrence():
 
     sb, inserts = _mock_supabase_tracking_tables()
 
-    happening_id, fully_resolved = create_happening_schedule_occurrence(
+    happening_id, fully_resolved, _ = create_happening_schedule_occurrence(
         supabase=sb,
         source_row=DATE_ONLY_SOURCE_ROW,
     )
@@ -131,7 +131,7 @@ def test_datetime_creates_happening_offering_and_occurrence():
 
     sb, inserts = _mock_supabase_tracking_tables()
 
-    happening_id, fully_resolved = create_happening_schedule_occurrence(
+    happening_id, fully_resolved, _ = create_happening_schedule_occurrence(
         supabase=sb,
         source_row=DATETIME_SOURCE_ROW,
     )

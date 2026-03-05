@@ -335,8 +335,8 @@ def test_offering_payload_stable_across_calls():
     sb1, builder1 = _mock_supabase()
     sb2, builder2 = _mock_supabase()
 
-    _hid1, _ok1 = create_happening_schedule_occurrence(supabase=sb1, source_row=SOURCE_ROW)
-    _hid2, _ok2 = create_happening_schedule_occurrence(supabase=sb2, source_row=SOURCE_ROW)
+    _hid1, _ok1, _ = create_happening_schedule_occurrence(supabase=sb1, source_row=SOURCE_ROW)
+    _hid2, _ok2, _ = create_happening_schedule_occurrence(supabase=sb2, source_row=SOURCE_ROW)
 
     # Both calls must access the offering table identically
     # (via eq chain in _get_or_create_offering's _find_existing)
@@ -500,7 +500,7 @@ def test_create_returns_valid_happening_id_for_provenance():
     from src.canonicalize.merge_loop import create_happening_schedule_occurrence
 
     sb, builder = _mock_supabase()
-    happening_id, fully_resolved = create_happening_schedule_occurrence(
+    happening_id, fully_resolved, _ = create_happening_schedule_occurrence(
         supabase=sb, source_row=SOURCE_ROW,
     )
 

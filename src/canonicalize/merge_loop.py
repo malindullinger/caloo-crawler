@@ -701,24 +701,32 @@ def create_happening_schedule_occurrence(
     source_row: Mapping[str, Any],
     run_id: str = "",
     counts: dict[str, int] | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     """
     Create or upsert:
       1) Happening (identity) — deduplicated via canonical_dedupe_key
       2) Offering (schedule) — upsert by offering_nk_key
       3) Occurrence (instance) — upsert by (happening_id, start_at, status)
 
-    If canonical_dedupe_key can be computed:
-      → upsert on canonical_dedupe_key; update only pipeline-safe fields
-        (never editorial_priority, visibility_override, visibility_status, etc.)
-    If canonical_dedupe_key is None/empty:
-      → plain insert + the row will need manual review
+    When a NEW happening must be inserted, uses rpc_create_happening_bundle_v1
+    to atomically create happening + happening_sources in a single transaction,
+    satisfying the enforce_happening_has_source constraint trigger.
 
-    Returns: (happening_id, fully_resolved)
+    If canonical_dedupe_key can be computed AND the key already exists:
+      → upsert on canonical_dedupe_key (UPDATE path, no trigger fires);
+        update only pipeline-safe fields
+        (never editorial_priority, visibility_override, visibility_status, etc.)
+    If canonical_dedupe_key can be computed but is new, OR is None/empty:
+      → use RPC for atomic insert, then enrich with remaining fields
+
+    Returns: (happening_id, fully_resolved, source_linked)
       fully_resolved=True  → all steps succeeded, caller should mark processed.
       fully_resolved=False → offering/occurrence had unresolvable constraint
                               violation; review was logged; caller should mark
                               needs_review instead of processed.
+      source_linked=True   → RPC already created the happening_sources row;
+                              caller must NOT call link_happening_source().
+      source_linked=False  → caller must call link_happening_source().
     """
     if counts is None:
         counts = {}
@@ -749,29 +757,75 @@ def create_happening_schedule_occurrence(
 
     happening_payload["confidence_score"] = _quality_score_from_source_row(source_row)
 
-    if canonical_key:
-        # Upsert: if a happening with this canonical_dedupe_key already exists,
-        # update only pipeline-safe fields. Never touch editorial or visibility.
-        upsert_payload = {
-            k: v for k, v in happening_payload.items()
-            if k not in EDITORIAL_PROTECTED_FIELDS
-            and k != "visibility_status"
-        }
-        happening = execute_with_retry(
-            supabase.table("happening")
-            .upsert(upsert_payload, on_conflict="canonical_dedupe_key")
-        ).data[0]
-    else:
-        # No canonical key — plain insert (fallback; should not happen for v1 rows).
-        print(f"[merge_loop] WARNING: no canonical_dedupe_key for source row {source_row.get('id')}")
-        happening = execute_with_retry(
-            supabase.table("happening").insert(happening_payload)
-        ).data[0]
-
-    happening_id = happening["id"]
-
     source_happening_id = str(source_row.get("id") or "")
     source_id_str = str(source_row.get("source_id") or "unknown")
+    source_linked = False
+
+    if canonical_key:
+        # Check whether a happening with this canonical_dedupe_key already exists.
+        # If yes → upsert (UPDATE path, no INSERT trigger).
+        # If no  → use RPC to atomically insert happening + happening_sources.
+        existing = execute_with_retry(
+            supabase.table("happening")
+            .select("id")
+            .eq("canonical_dedupe_key", canonical_key)
+            .limit(1)
+        ).data
+
+        if existing:
+            # UPDATE path — upsert will hit ON CONFLICT → UPDATE; no trigger fires.
+            upsert_payload = {
+                k: v for k, v in happening_payload.items()
+                if k not in EDITORIAL_PROTECTED_FIELDS
+                and k != "visibility_status"
+            }
+            happening = execute_with_retry(
+                supabase.table("happening")
+                .upsert(upsert_payload, on_conflict="canonical_dedupe_key")
+            ).data[0]
+        else:
+            # New happening — use RPC to satisfy provenance constraint atomically.
+            rpc_resp = execute_with_retry(
+                supabase.rpc("rpc_create_happening_bundle_v1", {
+                    "p_title": source_row.get("title_raw"),
+                    "p_description": source_row.get("description_raw"),
+                    "p_visibility_status": "draft",
+                    "p_source_happening_id": source_happening_id,
+                    "p_source_priority": source_priority_from_row(source_row),
+                })
+            )
+            happening_id_from_rpc = rpc_resp.data
+            # Enrich with fields the RPC does not set (tags, scores, dedupe key).
+            enrich_payload = {
+                k: v for k, v in happening_payload.items()
+                if k not in ("title", "description")
+                and k not in EDITORIAL_PROTECTED_FIELDS
+                and k != "visibility_status"
+            }
+            if enrich_payload:
+                execute_with_retry(
+                    supabase.table("happening")
+                    .update(enrich_payload)
+                    .eq("id", str(happening_id_from_rpc))
+                )
+            happening = {"id": happening_id_from_rpc}
+            source_linked = True
+    else:
+        # No canonical key — use RPC for atomic creation (fallback; should not happen for v1 rows).
+        print(f"[merge_loop] WARNING: no canonical_dedupe_key for source row {source_row.get('id')}")
+        rpc_resp = execute_with_retry(
+            supabase.rpc("rpc_create_happening_bundle_v1", {
+                "p_title": source_row.get("title_raw"),
+                "p_description": source_row.get("description_raw"),
+                "p_visibility_status": "draft",
+                "p_source_happening_id": source_happening_id,
+                "p_source_priority": source_priority_from_row(source_row),
+            })
+        )
+        happening = {"id": rpc_resp.data}
+        source_linked = True
+
+    happening_id = happening["id"]
 
     # --- Offering: upsert by offering_nk_key ---
     start_date = source_row.get("start_date_local")
@@ -793,7 +847,7 @@ def create_happening_schedule_occurrence(
     if offering_id is None:
         # Offering could not be created or found — review was logged.
         # Signal to caller: source row should be marked needs_review, not processed.
-        return str(happening_id), False
+        return str(happening_id), False, source_linked
 
     # --- Occurrence: upsert by (happening_id, start_at, status) ---
     # Only create an occurrence when we have a real start_at timestamp.
@@ -813,7 +867,7 @@ def create_happening_schedule_occurrence(
             counts=counts,
         )
 
-    return str(happening_id), True
+    return str(happening_id), True, source_linked
 
 
 # ---------------------------------------------------------------------------
@@ -1018,16 +1072,13 @@ def link_happening_source(
     )
 
 
-def mark_source_processed(
-    *,
-    supabase: Client,
-    source_happening_id: str,
-) -> None:
+def mark_source_processed(*, supabase: Client, source_happening_id: str) -> None:
     execute_with_retry(
         supabase.table("source_happenings")
         .update(
             {
                 "status": STATUS_PROCESSED,
+                "error_message": None,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -1328,18 +1379,19 @@ def run_merge_loop(
                         counts["created"] += 1
                         source_breakdown[src_name]["created"] += 1
                         if not dry_run:
-                            happening_id, fully_resolved = create_happening_schedule_occurrence(
+                            happening_id, fully_resolved, source_linked = create_happening_schedule_occurrence(
                                 supabase=supabase,
                                 source_row=source_row,
                                 run_id=run_id,
                                 counts=counts,
                             )
-                            link_happening_source(
-                                supabase=supabase,
-                                happening_id=happening_id,
-                                source_row=source_row,
-                                is_primary=True,
-                            )
+                            if not source_linked:
+                                link_happening_source(
+                                    supabase=supabase,
+                                    happening_id=happening_id,
+                                    source_row=source_row,
+                                    is_primary=True,
+                                )
                             if fully_resolved:
                                 mark_source_processed(
                                     supabase=supabase,

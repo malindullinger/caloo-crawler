@@ -591,7 +591,7 @@ def test_unresolvable_offering_returns_not_fully_resolved():
     }
 
     counts: dict[str, int] = {}
-    happening_id, fully_resolved = create_happening_schedule_occurrence(
+    happening_id, fully_resolved, _ = create_happening_schedule_occurrence(
         supabase=sb,
         source_row=source_row,
         run_id="test-run",

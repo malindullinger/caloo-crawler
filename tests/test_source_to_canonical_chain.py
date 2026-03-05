@@ -120,7 +120,7 @@ def test_eventbrite_source_creates_published_canonical_chain():
     sb, tables = _mock_supabase_per_table()
 
     # Step 1: CREATE path produces happening + offering + occurrence
-    happening_id, fully_resolved = create_happening_schedule_occurrence(
+    happening_id, fully_resolved, _ = create_happening_schedule_occurrence(
         supabase=sb, source_row=EVENTBRITE_SOURCE_ROW,
     )
 
@@ -175,7 +175,7 @@ def test_elternverein_source_creates_published_canonical_chain():
 
     sb, tables = _mock_supabase_per_table()
 
-    happening_id, fully_resolved = create_happening_schedule_occurrence(
+    happening_id, fully_resolved, _ = create_happening_schedule_occurrence(
         supabase=sb, source_row=ELTERNVEREIN_SOURCE_ROW,
     )
 
