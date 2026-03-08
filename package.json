@@ -1,0 +1,30 @@
+{
+  "name": "caloo-crawler",
+  "version": "1.0.0",
+  "description": "```bash make venv cp .env.example .env # fill in SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env make check make run",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/malindullinger/caloo-crawler.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/malindullinger/caloo-crawler/issues"
+  },
+  "homepage": "https://github.com/malindullinger/caloo-crawler#readme",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.98.0",
+    "dotenv": "^17.3.1",
+    "tsx": "^4.21.0"
+  }
+}

@@ -205,13 +205,84 @@ feed stays on `feed_cards_view` exclusively.
 
 ---
 
-## 10. Guardrails going forward
+## 10. Venue Geocoding & Duplicate Convergence
+
+> Completed: 2026-03-09
+
+### 10.1 Phase 5D.0 — Venue Geocoding
+
+Geocoding pipeline writes to `venue_geocode_result` staging table (proof-before-write).
+Venue lat/lng promoted from staging only after validation.
+
+- **Providers:** Nominatim (primary), geo.admin.ch (fallback)
+- **Staging table:** `venue_geocode_result` (migration `20260308130000`)
+- **Script:** `scripts/geocode/geocode_venues.ts` (idempotent, UPSERT on `venue_id,provider`)
+- **Result:** 144 venue rows geocoded (42 distinct names), 7 town-center fallbacks
+
+### 10.2 Venue Duplicate Diagnostics V2
+
+Pair-first diagnostic with three independent signals:
+1. Coordinate proximity (with town-center fallback detection)
+2. Normalized name similarity (place name + street, independently scored)
+3. Postal code agreement
+
+Tiers: A (safe auto-merge), B (needs review), C (do not auto-merge).
+Result: 17 Tier A, 18 Tier B, 306 Tier C pairs.
+
+- **Script:** `sql/ops/venue_duplicate_diagnostics_v2.sql`
+
+### 10.3 Venue Merge Phase 1 — FK Reassignment + Canonicalization (COMPLETE)
+
+5 approved Tier A merge groups (15 distinct venue names → 5 keepers + 10 discards).
+Hardcoded UUIDs — scope cannot broaden beyond approved groups.
+
+**Mutation results:**
+- 13 happenings reassigned from discard → keeper venues
+- 0 occurrences reassigned (none referenced discards)
+- 5 keeper venues canonicalized (name, address_line1, postal_code, locality)
+- 10 discard venue rows intentionally preserved (not deleted — deferred to Phase 2)
+- Post-mutation validation passed (all 4 assertions)
+- Feed joins resolve correctly with clean venue names + locality
+
+**Scripts:**
+- `sql/ops/venue_merge_groups_v1.sql` — connected-component merge groups
+- `sql/ops/venue_merge_preflight_v1.sql` — read-only preflight diagnostic
+- `sql/ops/venue_merge_execute_v1.sql` — mutation (transaction-wrapped, idempotent)
+
+**Remaining:**
+- Phase 2: delete discard venue rows (after confirming no regressions)
+- Tier B pairs: manual review required before any action
+
+### 10.4 Known Open Issue: Transform Provenance Bug (OPEN BLOCKER)
+
+`npm run validate` fails with:
+```
+provenance_violation: happening fc0237c7 inserted without any
+happening_sources row (must be created in same transaction)
+```
+
+This is **unrelated to the venue merge** — it is a **pre-existing bug in the
+canonical transform insert path**. The transform attempts to INSERT a new
+happening without creating the required `happening_sources` row in the same
+transaction. The happening `fc0237c7` does not exist in the database; the
+error fires during the transform's attempted INSERT.
+
+279 existing happenings also lack `happening_sources` rows (pre-existing
+provenance debt from before the constraint was added).
+
+This remains an **open blocker for full validation closure** — `npm run validate`
+cannot pass until the transform insert path is fixed to create `happening_sources`
+in the same transaction as the happening INSERT.
+
+---
+
+## 11. Guardrails going forward
 - No versioned views
 - No parallel feed logic
 - No quick fixes that bypass architecture
 - One canonical source, one mental model, one contract
 
-## 11. Deferred decisions (explicit)
+## 12. Deferred decisions (explicit)
 - Series semantics
 - Event vs Activity vs Happening taxonomy
 - Dedupe migration to SQL
@@ -220,7 +291,7 @@ feed stays on `feed_cards_view` exclusively.
 
 ---
 
-## 12. Cross-references
+## 13. Cross-references
 
 | Topic | Document |
 |-------|----------|
