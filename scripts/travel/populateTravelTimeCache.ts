@@ -31,7 +31,7 @@ declare const process: {
   exit(code?: number): never;
 };
 
-import { getSupabaseAdmin } from "../_shared/supabaseAdmin";
+import { getSupabaseAdmin } from "../_shared/supabaseAdmin.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -274,13 +274,14 @@ async function main() {
     console.log(`  - ${c.slug} (${c.name}) @ ${c.lat}, ${c.lng}`);
   }
 
-  // ── 2. Load venues with coordinates ───────────────────────────────
+    // ── 2. Load venues with coordinates ───────────────────────────────
+  // venue_travel_cache_candidates_v1 derives lat/lng from the canonical
+  // geo_point column via ST_X/ST_Y, since PostgREST cannot evaluate
+  // SQL expressions in .select().
 
   let venueQuery = supabase
-    .from("venue")
+    .from("venue_travel_cache_candidates_v1")
     .select("id, name, lat, lng")
-    .not("lat", "is", null)
-    .not("lng", "is", null)
     .order("name");
 
   if (args.limit) {
@@ -290,7 +291,7 @@ async function main() {
   const { data: venues, error: venueErr } = await venueQuery;
   if (venueErr) throw venueErr;
 
-  const venueRows = (venues ?? []) as Venue[];
+  const venueRows: Venue[] = (venues ?? []) as unknown as Venue[];
   if (venueRows.length === 0) {
     console.log("No geocoded venues found. Nothing to do.");
     return;
