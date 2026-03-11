@@ -1,4 +1,9 @@
 # src/canonicalize/sync.py
+#
+# TRANSITIONAL — This module migrates rows from the legacy `events` staging
+# table into `source_happenings`. It will be archived once all sources flow
+# through the canonical transform pipeline and no unmigrated `events` rows
+# remain. See also: scripts/canonicalize_cli.py (CLI wrapper).
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # scripts/canonicalize_cli.py
+#
+# TRANSITIONAL — CLI wrapper for src/canonicalize/sync.py. Will be archived
+# together with sync.py once the `events` → `source_happenings` migration is
+# complete. Reporting aspect partly superseded by admin_source_health_v1 view.
 
 from __future__ import annotations
 

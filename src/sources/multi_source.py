@@ -17,27 +17,6 @@ SOURCES: List[SourceConfig] = [
         max_items=50,
     ),
     SourceConfig(
-        source_id="ref-staefa-hombrechtikon",
-        adapter="church_hub",
-        seed_url="https://www.ref-staefa-hombrechtikon.ch/",
-        timezone="Europe/Zurich",
-        max_items=50,
-    ),
-    SourceConfig(
-        source_id="uetikon_vereinsliste",
-        adapter="vereins_directory",
-        seed_url="https://www.uetikonamsee.ch/vereinsliste",
-        timezone="Europe/Zurich",
-        max_items=200,
-    ),
-    SourceConfig(
-        source_id="kino-wildenmann",
-        adapter="kino_wildenmann",
-        seed_url="https://www.kino-wildenmann.ch/",
-        timezone="Europe/Zurich",
-        max_items=100,
-    ),
-    SourceConfig(
         source_id="eventbrite-zurich",
         adapter="eventbrite",
         seed_url="https://www.eventbrite.ch/d/switzerland--zurich/events/",
