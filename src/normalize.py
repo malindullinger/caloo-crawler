@@ -174,20 +174,27 @@ def _month_to_int(mon_raw: str) -> Optional[int]:
 
 
 # 22. Jan. 2026, 18.00 Uhr - 23.00 Uhr
+# Also: 29. März 2026, 15:00 Uhr bis 16:30 Uhr (colon time separator, "bis" range)
+# Also: Samstag, 29. März 2026, 15:00 Uhr bis 16:30 Uhr (optional day-of-week prefix)
 _SINGLE_DE_RE = re.compile(
+    r"(?:(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s*)?"
     r"(?P<day>\d{1,2})\.\s*(?P<mon>[A-Za-zÄÖÜäöü]+)\.?\s*(?P<year>\d{4})"
     r"(?:,\s*)?"
-    r"(?P<start_h>\d{1,2})\.(?P<start_m>\d{2})\s*Uhr"
-    r"(?:\s*-\s*(?P<end_h>\d{1,2})\.(?P<end_m>\d{2})\s*Uhr)?"
+    r"(?P<start_h>\d{1,2})[.:](?P<start_m>\d{2})\s*Uhr"
+    r"(?:\s*(?:-|bis)\s*(?P<end_h>\d{1,2})[.:](?P<end_m>\d{2})\s*Uhr)?",
+    re.IGNORECASE,
 )
 
 # 6. Jan. 2026 - 10. Feb. 2026, 14.00 Uhr - 14.45 Uhr, 45 Minuten
+# Also: range with colon time separator and "bis" range keyword
 _RANGE_DE_RE = re.compile(
-    r"(?P<sd>\d{1,2})\.\s*(?P<smon>[A-Za-zÄÖÜäöü]+)\.?\s*(?P<sy>\d{4})\s*-\s*"
+    r"(?:(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s*)?"
+    r"(?P<sd>\d{1,2})\.\s*(?P<smon>[A-Za-zÄÖÜäöü]+)\.?\s*(?P<sy>\d{4})\s*(?:-|bis)\s*"
     r"(?P<ed>\d{1,2})\.\s*(?P<emon>[A-Za-zÄÖÜäöü]+)\.?\s*(?P<ey>\d{4})"
     r"(?:,\s*)?"
-    r"(?:(?P<start_h>\d{1,2})\.(?P<start_m>\d{2})\s*Uhr"
-    r"(?:\s*-\s*(?P<end_h>\d{1,2})\.(?P<end_m>\d{2})\s*Uhr)?)?"
+    r"(?:(?P<start_h>\d{1,2})[.:](?P<start_m>\d{2})\s*Uhr"
+    r"(?:\s*(?:-|bis)\s*(?P<end_h>\d{1,2})[.:](?P<end_m>\d{2})\s*Uhr)?)?",
+    re.IGNORECASE,
 )
 
 
