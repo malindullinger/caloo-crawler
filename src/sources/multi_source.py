@@ -37,6 +37,20 @@ SOURCES: List[SourceConfig] = [
         timezone="Europe/Zurich",
         max_items=200,
     ),
+    SourceConfig(
+        source_id="meilen-portal",
+        adapter="maennedorf_portal",  # identical ICMS platform
+        seed_url="https://www.meilen.ch/anlaesseaktuelles",
+        timezone="Europe/Zurich",
+        max_items=50,
+    ),
+    SourceConfig(
+        source_id="ref-kirche-herrliberg",
+        adapter="kirchenweb",
+        seed_url="https://www.ref-herrliberg.ch/agenda?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+    ),
 ]
 
 

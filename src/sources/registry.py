@@ -7,6 +7,7 @@ from .adapters.maennedorf_portal import MaennedorfPortalAdapter
 from .adapters.eventbrite import EventbriteAdapter
 from .adapters.familienclub_herrliberg import FamilienclubHerrlibergAdapter
 from .adapters.gemeinde_herrliberg import GemeindeHerrlibergAdapter
+from .adapters.kirchenweb import KirchenwebAdapter
 
 
 ADAPTERS: Dict[str, Type[BaseAdapter]] = {
@@ -14,6 +15,7 @@ ADAPTERS: Dict[str, Type[BaseAdapter]] = {
     "eventbrite": EventbriteAdapter,
     "familienclub_herrliberg": FamilienclubHerrlibergAdapter,
     "gemeinde_herrliberg": GemeindeHerrlibergAdapter,
+    "kirchenweb": KirchenwebAdapter,
 }
 
 

@@ -131,7 +131,13 @@ class MaennedorfPortalAdapter(BaseAdapter):
         res = http_get(detail_url)
         soup = BeautifulSoup(res.text or "", "html.parser")
 
-        title = extract_title(soup)
+        # ICMS puts event title in og:title, not h1 (h1 = site nav element)
+        title = None
+        og = soup.find("meta", property="og:title")
+        if og and (og.get("content") or "").strip():
+            title = og["content"].strip()
+        if not title:
+            title = extract_title(soup, strip_title_suffix=" - ")
         if not title:
             return None
 
