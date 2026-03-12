@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
 from typing import List
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
+from ..extraction import extract_title
 from ..http import http_get
-from ..structured_time import extract_jsonld_event, extract_time_element
+from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
 
 
@@ -114,15 +114,11 @@ class MaennedorfPortalAdapter(BaseAdapter):
         # ----------------------------
         # 6) Fetch detail pages
         # ----------------------------
-        items: List[ExtractedItem] = []
-        for url in detail_urls:
-            try:
-                item = self._extract_from_detail(cfg, url)
-                if item:
-                    items.append(item)
-            except Exception as e:
-                print("MaennedorfPortalAdapter: detail parse failed:", url, "err:", repr(e))
-                continue
+        items = self._fetch_detail_pages(
+            detail_urls,
+            lambda url: self._extract_from_detail(cfg, url),
+            adapter_name="MaennedorfPortalAdapter",
+        )
 
         print("MaennedorfPortalAdapter: items built:", len(items))
         return items
@@ -135,50 +131,24 @@ class MaennedorfPortalAdapter(BaseAdapter):
         res = http_get(detail_url)
         soup = BeautifulSoup(res.text or "", "html.parser")
 
-        # Title: try h1 first, then fallback to <title>
-        title = ""
-        h1 = soup.find("h1")
-        if h1 and h1.get_text(strip=True):
-            title = h1.get_text(" ", strip=True)
-        if not title and soup.title:
-            title = soup.title.get_text(" ", strip=True)
-        title = (title or "").strip()
+        title = extract_title(soup)
         if not title:
             return None
 
         # Lead container for location + fallback datetime extraction
         lead = soup.select_one(".icms-lead-container")
 
-        # =====================================================
-        # Structured extraction: JSON-LD and <time> elements
-        # =====================================================
-        datetime_raw = None
+        # Tiers 1-3: structured extraction (JSON-LD → <time> → ISO text)
+        datetime_raw, extraction_method = extract_datetime_structured(soup, container=lead)
+
         location_raw = None
-        extraction_method = "text_heuristic"
 
-        # 1) Try JSON-LD first (most reliable when available)
-        structured = extract_jsonld_event(soup)
-        if structured and structured.start_iso:
-            extraction_method = "jsonld"
-            # Use " | " separator for unambiguous parsing in normalize.py
-            if structured.end_iso:
-                datetime_raw = f"{structured.start_iso} | {structured.end_iso}"
-            else:
-                datetime_raw = structured.start_iso
-
-        # 2) Try <time> element (prefer within lead container)
-        if not datetime_raw:
-            now_utc = datetime.now(timezone.utc)
-            structured = extract_time_element(soup, container=lead, reference_time=now_utc)
-            if structured and structured.start_iso:
-                extraction_method = "time_element"
-                datetime_raw = structured.start_iso
-
-        # 3) Fallback to text heuristic (TIER B QUARANTINE)
+        # Tier 4: text heuristic (TIER B QUARANTINE)
         # This text parsing is ONLY allowed for this source.
         # Pattern: "D. Mon. YYYY, HH.MM Uhr - HH.MM Uhr"
         # No inference, no defaults — if ambiguous, preserve unknown-time semantics.
         if not datetime_raw:
+            extraction_method = "text_heuristic"
             lead_lines: List[str] = []
             if lead:
                 lead_text = lead.get_text("\n", strip=True)

@@ -15,16 +15,18 @@ JSON-LD on Eventbrite detail pages provides:
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import List
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
+from ..extraction import extract_title
 from ..http import http_get
-from ..structured_time import extract_jsonld_event
+from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
 
 
@@ -47,15 +49,11 @@ class EventbriteAdapter(BaseAdapter):
         detail_urls = detail_urls[: cfg.max_items]
 
         # Fetch each detail page
-        items: List[ExtractedItem] = []
-        for url in detail_urls:
-            try:
-                item = self._extract_from_detail(url)
-                if item:
-                    items.append(item)
-            except Exception as e:
-                print(f"EventbriteAdapter: detail parse failed: {url} err: {repr(e)}")
-                continue
+        items = self._fetch_detail_pages(
+            detail_urls,
+            self._extract_from_detail,
+            adapter_name="EventbriteAdapter",
+        )
 
         print(f"EventbriteAdapter: items built: {len(items)}")
         return items
@@ -91,39 +89,30 @@ class EventbriteAdapter(BaseAdapter):
         res = http_get(detail_url)
         soup = BeautifulSoup(res.text or "", "html.parser")
 
-        # Try JSON-LD extraction (primary method for Eventbrite)
-        structured = extract_jsonld_event(soup)
+        # Tiers 1-3 (Eventbrite: tier 1 / JSON-LD expected to always succeed)
+        datetime_raw, extraction_method = extract_datetime_structured(soup)
 
-        if structured and structured.start_iso:
-            # JSON-LD found - use it
-            extraction_method = "jsonld"
-
-            # Get title from JSON-LD or fallback to page
-            title = self._get_title_from_jsonld(soup) or self._get_title_from_page(soup)
-            if not title:
-                return None
-
-            # Build datetime_raw using pipe separator
-            if structured.end_iso:
-                datetime_raw = f"{structured.start_iso} | {structured.end_iso}"
-            else:
-                datetime_raw = structured.start_iso
-
-            # Get location from JSON-LD
-            location_raw = self._get_location_from_jsonld(soup)
-
-        else:
-            # Fallback to text extraction (rare for Eventbrite)
-            extraction_method = "text_heuristic"
-
-            title = self._get_title_from_page(soup)
-            if not title:
-                return None
-
+        # Tier 4: Eventbrite CSS selector fallback (rare — JSON-LD almost always present)
+        if not datetime_raw:
             datetime_raw = self._extract_datetime_text(soup)
-            if not datetime_raw:
-                return None
+            if datetime_raw:
+                extraction_method = "text_heuristic"
 
+        if not datetime_raw:
+            return None
+
+        # Title: prefer JSON-LD name when available, fall back to page extraction
+        if extraction_method == "jsonld":
+            title = self._get_title_from_jsonld(soup) or extract_title(soup)
+        else:
+            title = extract_title(soup)
+        if not title:
+            return None
+
+        # Location: prefer JSON-LD when available
+        if extraction_method == "jsonld":
+            location_raw = self._get_location_from_jsonld(soup)
+        else:
             location_raw = self._extract_location_text(soup)
 
         # Get description
@@ -145,8 +134,6 @@ class EventbriteAdapter(BaseAdapter):
 
     def _get_title_from_jsonld(self, soup: BeautifulSoup) -> str | None:
         """Extract title from JSON-LD Event."""
-        import json
-
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.get_text() or "")
@@ -164,30 +151,8 @@ class EventbriteAdapter(BaseAdapter):
                 continue
         return None
 
-    def _get_title_from_page(self, soup: BeautifulSoup) -> str | None:
-        """Extract title from page HTML."""
-        # Try h1
-        h1 = soup.find("h1")
-        if h1:
-            text = h1.get_text(" ", strip=True)
-            if text:
-                return text
-
-        # Try og:title
-        og = soup.find("meta", property="og:title")
-        if og and og.get("content"):
-            return og["content"].strip()
-
-        # Try <title>
-        if soup.title:
-            return soup.title.get_text(" ", strip=True)
-
-        return None
-
     def _get_location_from_jsonld(self, soup: BeautifulSoup) -> str | None:
         """Extract location from JSON-LD Event."""
-        import json
-
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.get_text() or "")

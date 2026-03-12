@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -173,6 +173,51 @@ def _pick_best_time_candidate(
             continue
 
     return best_str
+
+
+# ISO 8601 datetime in page text: "2026-03-12T08:30:00+01:00" or "2026-03-12T15:00"
+_ISO_TEXT_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:\d{2})?"
+)
+
+
+def extract_datetime_structured(
+    soup: BeautifulSoup,
+    *,
+    container: Tag | None = None,
+) -> tuple[str | None, str]:
+    """Run tiers 1-3 of structured datetime extraction.
+
+    Tier 1: JSON-LD Event startDate/endDate
+    Tier 2: <time datetime="..."> elements
+    Tier 3: ISO 8601 strings in page text
+
+    Returns (datetime_raw, extraction_method).
+    extraction_method is "jsonld", "time_element", "iso_text", or "none".
+    Adapters call this first, then fall back to their own heuristic.
+    """
+    # Tier 1: JSON-LD
+    structured = extract_jsonld_event(soup)
+    if structured and structured.start_iso:
+        if structured.end_iso:
+            return f"{structured.start_iso} | {structured.end_iso}", "jsonld"
+        return structured.start_iso, "jsonld"
+
+    # Tier 2: <time> elements
+    now_utc = datetime.now(timezone.utc)
+    structured = extract_time_element(soup, container=container, reference_time=now_utc)
+    if structured and structured.start_iso:
+        return structured.start_iso, "time_element"
+
+    # Tier 3: ISO 8601 text in page content
+    page_text = soup.get_text(" ", strip=True)
+    iso_matches = _ISO_TEXT_RE.findall(page_text)
+    if iso_matches:
+        if len(iso_matches) >= 2:
+            return f"{iso_matches[0]} | {iso_matches[1]}", "iso_text"
+        return iso_matches[0], "iso_text"
+
+    return None, "none"
 
 
 def parse_iso_datetime(s: str, default_tz: ZoneInfo) -> datetime | None:

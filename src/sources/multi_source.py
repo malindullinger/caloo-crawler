@@ -23,6 +23,20 @@ SOURCES: List[SourceConfig] = [
         timezone="Europe/Zurich",
         max_items=20,  # Limited for testing
     ),
+    SourceConfig(
+        source_id="familienclub-herrliberg",
+        adapter="familienclub_herrliberg",
+        seed_url="https://familienclub-herrliberg.ch/agenda/",
+        timezone="Europe/Zurich",
+        max_items=200,
+    ),
+    SourceConfig(
+        source_id="gemeinde-herrliberg",
+        adapter="gemeinde_herrliberg",
+        seed_url="https://www.herrliberg.ch/leben/freizeit/veranstaltungen.html/235",
+        timezone="Europe/Zurich",
+        max_items=200,
+    ),
 ]
 
 
