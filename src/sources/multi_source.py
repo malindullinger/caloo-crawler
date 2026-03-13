@@ -193,13 +193,16 @@ def fetch_and_extract() -> List[RawEvent]:
         future = pool.submit(_process_source, cfg, now)
         futures[future] = cfg
 
+    source_counts: dict[str, int] = {}
     try:
         for future in as_completed(futures, timeout=TOTAL_TIMEOUT_S):
             cfg = futures[future]
             try:
                 result = future.result()  # already complete — returns immediately
+                source_counts[cfg.source_id] = len(result)
                 out.extend(result)
             except Exception:
+                source_counts[cfg.source_id] = -1  # -1 = failed
                 print(f"[crawl] {cfg.source_id} — FAILED")
                 traceback.print_exc()
     except TimeoutError:
@@ -210,6 +213,17 @@ def fetch_and_extract() -> List[RawEvent]:
         # Cancel pending (not-yet-started) futures. Running threads continue
         # in background until their current HTTP request finishes (~30s max).
         pool.shutdown(wait=False, cancel_futures=True)
+
+    # Post-crawl output validation: detect silent adapter failures
+    for cfg in enabled:
+        count = source_counts.get(cfg.source_id)
+        if count is None:
+            print(f"[crawl] WARN: source {cfg.source_id!r} did not complete (timeout or cancelled)")
+        elif count == 0:
+            print(
+                f"[crawl] WARN: source {cfg.source_id!r} returned 0 items — "
+                f"possible causes: adapter broken, site structure changed, anti-bot block"
+            )
 
     elapsed = time.monotonic() - t_start
     print(f"[crawl] all sources done: {len(out)} total items in {elapsed:.1f}s")
