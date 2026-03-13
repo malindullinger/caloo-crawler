@@ -73,16 +73,24 @@ async function main() {
     return sourceSystemIdByKey.get(k) ?? null;
   }
 
-  // 1) Load raw rows
-  const { data: rawRows, error: rawErr } = await supabase
-    .from("event_raw")
-    .select("id, source_id, source_url, item_url, raw_payload, fetched_at, status")
-    .eq("status", "ok")
-    .limit(5000);
+  // 1) Load raw rows (paginated — PostgREST caps at 1000 per request)
+  const PAGE_SIZE = 1000;
+  const rows: EventRawRow[] = [];
+  let offset = 0;
+  while (true) {
+    const { data: page, error: rawErr } = await supabase
+      .from("event_raw")
+      .select("id, source_id, source_url, item_url, raw_payload, fetched_at, status")
+      .eq("status", "ok")
+      .order("id")
+      .range(offset, offset + PAGE_SIZE - 1);
 
-  if (rawErr) throw rawErr;
-
-  const rows = (rawRows ?? []) as EventRawRow[];
+    if (rawErr) throw rawErr;
+    const batch = (page ?? []) as EventRawRow[];
+    rows.push(...batch);
+    if (batch.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+  }
   console.log(`[ingest:raw] Loaded event_raw rows: ${rows.length}`);
 
   // 2) Build docs

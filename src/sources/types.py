@@ -14,6 +14,9 @@ class SourceConfig:
     max_items: int = 100
     enabled: bool = True
     extra: Dict[str, Any] | None = None
+    # -- Source manifest fields (declarative, used for validation + documentation) --
+    municipality: str = ""       # canonical municipality name (must match transformCanonical.ts)
+    platform: str = ""           # CMS/platform identifier (e.g., "kirchenweb", "ai1ec", "icms")
 
 
 @dataclass

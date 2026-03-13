@@ -7,7 +7,7 @@ Strategy:
 - Fetch each detail page
 - Extract datetime via JSON-LD (extract_datetime_structured)
 - Extract title via h1 (extract_title)
-- Extract location from span.veranstaltungLeadOrt
+- Extract location from span.veranstaltungLeadOrt (CSS) or JSON-LD Place.name (fallback)
 - Extract description from div.vinfobeschreibung
 
 Classification: Tier A (JSON-LD on every detail page)
@@ -15,6 +15,7 @@ Platform: kirchenweb.ch (TYPO3-based Swiss church CMS)
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import List
@@ -143,11 +144,25 @@ class KirchenwebAdapter(BaseAdapter):
         if not datetime_raw:
             return None
 
-        # Location: span.veranstaltungLeadOrt
+        # Location: CSS first, JSON-LD Place.name fallback
         location_raw = None
         loc_el = soup.select_one("span.veranstaltungLeadOrt")
         if loc_el:
             location_raw = loc_el.get_text(" ", strip=True)
+
+        if not location_raw:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    ld = json.loads(script.get_text() or "")
+                    if isinstance(ld, dict) and ld.get("@type") == "Event":
+                        loc_obj = ld.get("location")
+                        if isinstance(loc_obj, dict):
+                            name = (loc_obj.get("name") or "").strip()
+                            if name:
+                                location_raw = name
+                                break
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    continue
 
         # Description: div.vinfobeschreibung
         description_raw = None

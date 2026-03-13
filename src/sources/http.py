@@ -24,7 +24,7 @@ def http_get(url: str, *, render_js: bool = False, timeout_s: int = 30) -> HttpR
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, timeout=30000)
         page = browser.new_page()
 
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
