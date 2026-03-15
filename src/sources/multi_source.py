@@ -94,6 +94,24 @@ SOURCES: List[SourceConfig] = [
         municipality="meilen",
         platform="kirchenweb",
     ),
+    SourceConfig(
+        source_id="frauenverein-maennedorf",
+        adapter="frauenverein_maennedorf",
+        seed_url="https://www.frauenverein-maennedorf.ch/agenda.html",
+        timezone="Europe/Zurich",
+        max_items=50,
+        municipality="maennedorf",
+        platform="contao",
+    ),
+    SourceConfig(
+        source_id="ref-kirche-maennedorf",
+        adapter="ref_kirche_maennedorf",
+        seed_url="https://www.ref-maennedorf.ch/agenda/",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="maennedorf",
+        platform="typo3_kool",
+    ),
 ]
 
 
