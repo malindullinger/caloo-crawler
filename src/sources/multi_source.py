@@ -121,6 +121,15 @@ SOURCES: List[SourceConfig] = [
         municipality="maennedorf",
         platform="typo3_kool",
     ),
+    SourceConfig(
+        source_id="fluugepilz-erlenbach",
+        adapter="fluugepilz",
+        seed_url="https://www.xn--flgepilz-75aa.ch/events/feed/",
+        timezone="Europe/Zurich",
+        max_items=50,
+        municipality="erlenbach",
+        platform="wp_events_manager",
+    ),
 ]
 
 

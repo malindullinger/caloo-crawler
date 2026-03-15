@@ -26,7 +26,7 @@ sources (Tier A anchors) before platform aggregators. See
 | Source | source_id | Seed URL | Platform | Status | Notes |
 |--------|-----------|----------|----------|--------|-------|
 | ~~Ref. Kirche Stäfa-Hombrechtikon~~ | `ref-staefa-hombrechtikon` | — | Kirchenweb | **active** | Moved to production 2026-03-15. Config-only onboarding (kirchenweb adapter). `a.agendaTitel` confirmed. ~1000 events discovered. See `source-status.md`. |
-| Fluugepilz (Erlenbach) | `fluugepilz-erlenbach` | https://www.xn--flgepilz-75aa.ch/events/feed/ | WordPress + Events Manager | candidate | Family centre. Domain is flüügepilz.ch (punycode). RSS feed with all 19 events in single request. Tier A (structured datetime in `<pubDate>`). WordPress Events Manager (not Tribe). |
+| ~~Fluugepilz (Erlenbach)~~ | `fluugepilz-erlenbach` | — | WordPress + Events Manager | **active** | Moved to production 2026-03-15. RSS adapter. 19 events. WordPress Events Manager family 1/3. Opens Erlenbach municipality. See `source-status.md`. |
 
 ## Priority 3 — Deferred
 
@@ -47,4 +47,4 @@ sources (Tier A anchors) before platform aggregators. See
 | Theater Tamtam | theater-tamtam.ch | Custom | 11 courses but custom layout, no structured dates. Fair difficulty, low ROI. |
 | Schule Männedorf | schule-maennedorf.ch | i-web | No public event calendar. |
 
-Last updated: 2026-03-15
+Last updated: 2026-03-15 (Fluugepilz Erlenbach onboarded)
