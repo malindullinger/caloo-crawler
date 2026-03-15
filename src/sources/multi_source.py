@@ -95,6 +95,15 @@ SOURCES: List[SourceConfig] = [
         platform="kirchenweb",
     ),
     SourceConfig(
+        source_id="ref-staefa-hombrechtikon",
+        adapter="kirchenweb",  # identical kirchenweb.ch platform
+        seed_url="https://www.ref-staefa-hombrechtikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="staefa",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
         source_id="frauenverein-maennedorf",
         adapter="frauenverein_maennedorf",
         seed_url="https://www.frauenverein-maennedorf.ch/agenda.html",

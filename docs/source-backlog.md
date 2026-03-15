@@ -25,8 +25,8 @@ sources (Tier A anchors) before platform aggregators. See
 
 | Source | source_id | Seed URL | Platform | Status | Notes |
 |--------|-----------|----------|----------|--------|-------|
-| Ref. Kirche Stäfa-Hombrechtikon | `ref-staefa-hombrechtikon` | https://www.ref-staefa-hombrechtikon.ch/ | Kirchenweb | candidate | Config-only onboarding (kirchenweb adapter). Verify `a.agendaTitel` CSS class presence — may need two-tier link selection enhancement. |
-| Fluugepilz (Erlenbach) | `fluugepilz-erlenbach` | https://www.fluugepilz.ch/ | WordPress + Events Manager | candidate | Family centre. WordPress events family 1/3. Structured event listing with dates. |
+| ~~Ref. Kirche Stäfa-Hombrechtikon~~ | `ref-staefa-hombrechtikon` | — | Kirchenweb | **active** | Moved to production 2026-03-15. Config-only onboarding (kirchenweb adapter). `a.agendaTitel` confirmed. ~1000 events discovered. See `source-status.md`. |
+| Fluugepilz (Erlenbach) | `fluugepilz-erlenbach` | https://www.xn--flgepilz-75aa.ch/events/feed/ | WordPress + Events Manager | candidate | Family centre. Domain is flüügepilz.ch (punycode). RSS feed with all 19 events in single request. Tier A (structured datetime in `<pubDate>`). WordPress Events Manager (not Tribe). |
 
 ## Priority 3 — Deferred
 
