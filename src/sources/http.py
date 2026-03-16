@@ -64,8 +64,6 @@ def _check_suspicious(result: HttpResult) -> None:
 
 
 def http_get(url: str, *, render_js: bool = False, timeout_s: int = 30) -> HttpResult:
-    print(f"http_get(): render_js={render_js} url={url}")
-
     if not render_js:
         r = requests.get(url, timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"})
         result = HttpResult(url=r.url, status_code=r.status_code, text=r.text)
@@ -97,10 +95,6 @@ def http_get(url: str, *, render_js: bool = False, timeout_s: int = 30) -> HttpR
 
         html = page.content()
         final_url = page.url
-
-        print("http_get(): Playwright used. final_url=", final_url, " html_len=", len(html))
-        print("http_get(): contains /_rte/anlass/ =", "/_rte/anlass/" in html)
-        print("http_get(): contains /anlaesseaktuelles/ =", "/anlaesseaktuelles/" in html)
 
         browser.close()
         result = HttpResult(url=final_url, status_code=200, text=html)

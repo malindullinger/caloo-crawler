@@ -371,7 +371,13 @@ def raw_to_normalized(
         location_name=location_name,
     )
 
-    canonical_url = str(raw.item_url) if raw.item_url else str(raw.source_url)
+    # Safety: when item_url is missing, source_url is shared across all events
+    # from the same source. Append external_id fragment to prevent upsert collisions
+    # on the (source_id, canonical_url) unique constraint in the events table.
+    if raw.item_url:
+        canonical_url = str(raw.item_url)
+    else:
+        canonical_url = f"{raw.source_url}#evt-{external_id[:16]}"
 
     return NormalizedEvent(
         external_id=external_id,

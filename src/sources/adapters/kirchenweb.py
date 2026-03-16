@@ -150,19 +150,31 @@ class KirchenwebAdapter(BaseAdapter):
         if loc_el:
             location_raw = loc_el.get_text(" ", strip=True)
 
-        if not location_raw:
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    ld = json.loads(script.get_text() or "")
-                    if isinstance(ld, dict) and ld.get("@type") == "Event":
+        # JSON-LD: extract location fallback + organiser
+        organiser: dict | None = None
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                ld = json.loads(script.get_text() or "")
+                if isinstance(ld, dict) and ld.get("@type") == "Event":
+                    # Location fallback (only if CSS extraction missed)
+                    if not location_raw:
                         loc_obj = ld.get("location")
                         if isinstance(loc_obj, dict):
-                            name = (loc_obj.get("name") or "").strip()
-                            if name:
-                                location_raw = name
-                                break
-                except (json.JSONDecodeError, TypeError, AttributeError):
-                    continue
+                            loc_name = (loc_obj.get("name") or "").strip()
+                            if loc_name:
+                                location_raw = loc_name
+                    # Organiser
+                    org_obj = ld.get("organizer")
+                    if isinstance(org_obj, dict):
+                        name = (org_obj.get("name") or "").strip()
+                        url = (org_obj.get("url") or "").strip()
+                        if name:
+                            organiser = {"name": name, **({"url": url} if url else {})}
+                    elif isinstance(org_obj, str) and org_obj.strip():
+                        organiser = {"name": org_obj.strip()}
+                    break
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
 
         # Description: div.vinfobeschreibung
         description_raw = None
@@ -184,6 +196,7 @@ class KirchenwebAdapter(BaseAdapter):
                 "adapter": "kirchenweb",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
+                **({"organiser": organiser} if organiser else {}),
             },
             fetched_at=self.now_utc(),
         )

@@ -158,6 +158,37 @@ def _classify_relevance(category: str) -> str:
     return "exclude"
 
 
+def _parse_ics_organizer(vevent_text: str) -> dict:
+    """Extract organiser name and email from ICS ORGANIZER field.
+
+    ICS format: ORGANIZER;CN=Display Name:mailto:email@example.com
+    Returns {"organiser": {"name": ..., "email": ...}} or empty dict.
+    """
+    m = re.search(r"^ORGANIZER(;[^:]+)?:(.+)$", vevent_text, re.MULTILINE)
+    if not m:
+        return {}
+
+    params = m.group(1) or ""
+    value = m.group(2).strip().rstrip("\r")
+
+    inner: dict = {}
+
+    # Extract CN (common name) parameter
+    cn_match = re.search(r"CN=([^;:]+)", params, re.IGNORECASE)
+    if cn_match:
+        name = cn_match.group(1).strip().strip('"')
+        if name:
+            inner["name"] = name
+
+    # Extract email from mailto: URI
+    if value.lower().startswith("mailto:"):
+        email = value[7:].strip()
+        if email:
+            inner["email"] = email
+
+    return {"organiser": inner} if inner else {}
+
+
 def _unescape_ics(text: str) -> str:
     """Unescape ICS text values (RFC 5545 §3.3.11)."""
     return (
@@ -287,6 +318,7 @@ class RefKircheMaennedorfAdapter(BaseAdapter):
         location = _parse_ics_field(vevent, "LOCATION")
         description = _parse_ics_field(vevent, "DESCRIPTION")
         uid = _parse_ics_field(vevent, "UID")
+        organiser_info = _parse_ics_organizer(vevent)
 
         # Convert to ISO 8601
         start_iso = _ics_datetime_to_iso(dtstart_raw, vevent, "DTSTART")
@@ -334,6 +366,7 @@ class RefKircheMaennedorfAdapter(BaseAdapter):
                 "ics_summary": summary,
                 "relevance": relevance,
                 "ics_uid": uid,
+                **organiser_info,
             },
             fetched_at=self.now_utc(),
         )

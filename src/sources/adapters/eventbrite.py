@@ -118,6 +118,9 @@ class EventbriteAdapter(BaseAdapter):
         # Get description
         description_raw = self._get_description(soup)
 
+        # Organiser from JSON-LD
+        organiser_info = self._get_organiser_from_jsonld(soup) if extraction_method == "jsonld" else None
+
         return ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,
@@ -128,6 +131,7 @@ class EventbriteAdapter(BaseAdapter):
                 "adapter": "eventbrite",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
+                **(organiser_info or {}),
             },
             fetched_at=datetime.now(timezone.utc),
         )
@@ -169,6 +173,26 @@ class EventbriteAdapter(BaseAdapter):
                         elif isinstance(addr, str):
                             return f"{name}, {addr}" if name else addr
                         return name or None
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return None
+
+    def _get_organiser_from_jsonld(self, soup: BeautifulSoup) -> dict | None:
+        """Extract organiser info from JSON-LD Event."""
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.get_text() or "")
+                events = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for item in events:
+                    if isinstance(item, dict) and item.get("@type") == "Event":
+                        org = item.get("organizer")
+                        if isinstance(org, dict):
+                            name = (org.get("name") or "").strip()
+                            url = (org.get("url") or "").strip()
+                            if name:
+                                return {"organiser": {"name": name, **({"url": url} if url else {})}}
+                        elif isinstance(org, str) and org.strip():
+                            return {"organiser": {"name": org.strip()}}
             except (json.JSONDecodeError, TypeError):
                 continue
         return None

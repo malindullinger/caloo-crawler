@@ -138,6 +138,9 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
         # Conservative: leave as None rather than risk incorrect extraction
         location_raw = None
 
+        # Organiser from JSON-LD @graph
+        organiser_info = self._extract_jsonld_organiser(soup)
+
         return ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,
@@ -148,6 +151,7 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
                 "adapter": "frauenverein_maennedorf",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
+                **(organiser_info or {}),
             },
             fetched_at=self.now_utc(),
         )
@@ -165,6 +169,25 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
                     name = event.get("name", "").strip()
                     if name:
                         return name
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_jsonld_organiser(soup: BeautifulSoup) -> dict | None:
+        """Extract organiser from JSON-LD Event (@graph-aware)."""
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.get_text() or "")
+                for event in _find_events(data):
+                    org = event.get("organizer")
+                    if isinstance(org, dict):
+                        name = (org.get("name") or "").strip()
+                        url = (org.get("url") or "").strip()
+                        if name:
+                            return {"organiser": {"name": name, **({"url": url} if url else {})}}
+                    elif isinstance(org, str) and org.strip():
+                        return {"organiser": {"name": org.strip()}}
             except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
         return None

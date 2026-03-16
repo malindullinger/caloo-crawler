@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import date as Date
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,32 @@ from .config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from .models import NormalizedEvent, RawEvent
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+T = TypeVar("T")
+
+_MAX_RETRIES = 2
+_RETRY_DELAY_S = 1.0
+
+
+def _with_retry(fn: Callable[[], T], label: str) -> T:
+    """Execute a Supabase call with retry on transient failures."""
+    last_err: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            is_transient = any(
+                kw in err_str
+                for kw in ("timeout", "connection", "502", "503", "504", "rate")
+            )
+            if not is_transient or attempt >= _MAX_RETRIES:
+                raise
+            delay = _RETRY_DELAY_S * (2 ** attempt)
+            print(f"[storage] {label} transient error (attempt {attempt + 1}), retrying in {delay}s: {e}")
+            time.sleep(delay)
+    raise last_err  # unreachable, but satisfies type checker
 
 
 def _sha256_hex(s: str) -> str:
@@ -52,7 +79,10 @@ def store_raw(raw: RawEvent) -> None:
         "error": None,
     }
 
-    supabase.table("event_raw").insert(row).execute()
+    _with_retry(
+        lambda: supabase.table("event_raw").insert(row).execute(),
+        f"store_raw({raw.source_id})",
+    )
 
 
 # ----------------------------
@@ -78,7 +108,13 @@ def upsert_event(ev: NormalizedEvent) -> None:
         "date_precision": ev.date_precision,
     }
 
-    supabase.table("events").upsert(row, on_conflict="source_id,canonical_url").execute()
+    # Safety: canonical_url is guaranteed unique per event since normalize.py
+    # appends #evt-{external_id[:16]} when item_url is missing.
+    # This prevents silent overwrites for events sharing the same source_url.
+    _with_retry(
+        lambda: supabase.table("events").upsert(row, on_conflict="source_id,canonical_url").execute(),
+        f"upsert_event({ev.source_id})",
+    )
 
 
 # ----------------------------
@@ -206,10 +242,13 @@ def insert_schedules(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        supabase.table("event_schedules").upsert(
-            row,
-            on_conflict="event_external_id,schedule_type",
-        ).execute()
+        _with_retry(
+            lambda: supabase.table("event_schedules").upsert(
+                row,
+                on_conflict="event_external_id,schedule_type",
+            ).execute(),
+            f"schedule_window({event_external_id[:12]})",
+        )
         return
 
     # -----------------------------------------
@@ -245,10 +284,13 @@ def insert_schedules(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        supabase.table("event_schedules").upsert(
-            row,
-            on_conflict="event_external_id,schedule_type",
-        ).execute()
+        _with_retry(
+            lambda: supabase.table("event_schedules").upsert(
+                row,
+                on_conflict="event_external_id,schedule_type",
+            ).execute(),
+            f"schedule_session({event_external_id[:12]})",
+        )
         return
 
     # Other types => do nothing for now

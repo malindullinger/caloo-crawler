@@ -1,4 +1,6 @@
 // scripts/ingest/ingestRaw.ts
+//
+// Phase 6K.A — Pipeline observability: per-stage timing and structured JSON summary.
 import { getSupabaseAdmin } from "../_shared/supabaseAdmin";
 import crypto from "crypto";
 
@@ -56,6 +58,7 @@ function chunk<T>(arr: T[], size: number): T[][] {
 }
 
 async function main() {
+  const t0 = Date.now();
   const supabase = getSupabaseAdmin();
 
   // 0) Resolve source_system_id by source_system.key
@@ -91,13 +94,19 @@ async function main() {
     if (batch.length < PAGE_SIZE) break;
     offset += PAGE_SIZE;
   }
+
+  const tLoadDone = Date.now();
   console.log(`[ingest:raw] Loaded event_raw rows: ${rows.length}`);
 
   // 2) Build docs
+  let skippedNoSourceSystem = 0;
   const docs = rows
     .map((r) => {
       const sourceSystemId = resolveSourceSystemId(r.source_id);
-      if (!sourceSystemId) return null;
+      if (!sourceSystemId) {
+        skippedNoSourceSystem += 1;
+        return null;
+      }
 
       const payload = r.raw_payload ?? {};
       const itemUrl = normalizeText(payload?.item_url) || normalizeText(r.item_url) || "";
@@ -129,10 +138,28 @@ async function main() {
       content_hash: string;
     }>;
 
+  const tTransformDone = Date.now();
   console.log(`[ingest:raw] Prepared source_document rows: ${docs.length}`);
 
   if (docs.length === 0) {
     console.log("[ingest:raw] No docs to write. Done.");
+    const summary = {
+      stage: "ingestRaw",
+      rows_loaded: rows.length,
+      rows_prepared: 0,
+      rows_deduped: 0,
+      rows_upserted: 0,
+      rows_skipped_no_source_system: skippedNoSourceSystem,
+      source_document_count: 0,
+      duration_ms: {
+        load: tLoadDone - t0,
+        transform: tTransformDone - tLoadDone,
+        dedupe: 0,
+        upsert: 0,
+        total: Date.now() - t0,
+      },
+    };
+    console.log(`[ingest:raw] DONE`, JSON.stringify(summary, null, 2));
     return;
   }
 
@@ -172,6 +199,8 @@ async function main() {
     console.log(`[ingest:raw] Deduped ${removed} rows within batch (prevents 21000).`);
   }
 
+  const tDedupeDone = Date.now();
+
   // 4) Upsert (chunked for safety)
   const conflictTarget = "source_system_id,source_entity_key,content_hash";
   const chunks = chunk(deduped, 500);
@@ -185,6 +214,8 @@ async function main() {
     console.log(`[ingest:raw] Upserted batch ${i + 1}/${chunks.length} (${batch.length} rows)`);
   }
 
+  const tUpsertDone = Date.now();
+
   // 5) Quick sanity count
   const { count: rawCount, error: cntErr } = await supabase
     .from("source_document")
@@ -192,7 +223,26 @@ async function main() {
 
   if (cntErr) throw cntErr;
 
-  console.log(`[ingest:raw] Done. source_document count = ${rawCount ?? 0}`);
+  // 6K.A: Structured JSON summary for pipeline observability.
+  const summary = {
+    stage: "ingestRaw",
+    rows_loaded: rows.length,
+    rows_prepared: docs.length,
+    rows_deduped: deduped.length,
+    rows_upserted: deduped.length,
+    rows_skipped_no_source_system: skippedNoSourceSystem,
+    rows_removed_by_dedupe: removed,
+    source_document_count: rawCount ?? 0,
+    duration_ms: {
+      load: tLoadDone - t0,
+      transform: tTransformDone - tLoadDone,
+      dedupe: tDedupeDone - tTransformDone,
+      upsert: tUpsertDone - tDedupeDone,
+      total: Date.now() - t0,
+    },
+  };
+
+  console.log(`[ingest:raw] DONE`, JSON.stringify(summary, null, 2));
 }
 
 main().catch((err: any) => {

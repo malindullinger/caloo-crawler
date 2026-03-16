@@ -12,7 +12,7 @@ from ..models import RawEvent
 
 # Parallelization config
 MAX_WORKERS = 4           # concurrent source threads (each source = different domain)
-TOTAL_TIMEOUT_S = 900     # 15 min — total time fetch_and_extract() will wait for results
+TOTAL_TIMEOUT_S = 1800    # 30 min — total time fetch_and_extract() will wait for results
 # After TOTAL_TIMEOUT_S, the main thread stops waiting. Pending (not-yet-started)
 # futures are cancelled. Running worker threads continue in the background until
 # their current HTTP request completes (bounded by 30s per-request timeouts in
@@ -101,6 +101,69 @@ SOURCES: List[SourceConfig] = [
         timezone="Europe/Zurich",
         max_items=200,
         municipality="staefa",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="ref-kirche-zollikon-zumikon",
+        adapter="kirchenweb",
+        seed_url="https://www.ref-zozu.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="zollikon",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="kath-kirche-zollikon-zumikon",
+        adapter="kirchenweb",
+        seed_url="https://www.kath-zollikon-zumikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="zollikon",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="ref-kirche-kuesnacht",
+        adapter="kirchenweb",
+        seed_url="https://www.rkk.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="kuesnacht",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="ref-kirche-erlenbach",
+        adapter="kirchenweb",
+        seed_url="https://www.ref-erlenbach.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="erlenbach",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="ref-kirche-uetikon",
+        adapter="kirchenweb",
+        seed_url="https://www.ref-uetikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="uetikon",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="kath-pfarrei-staefa",
+        adapter="kirchenweb",
+        seed_url="https://www.pfarreistaefa.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="staefa",
+        platform="kirchenweb",
+    ),
+    SourceConfig(
+        source_id="kath-pfarrei-hombrechtikon",
+        adapter="kirchenweb",
+        seed_url="https://www.pfarreistniklaus.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="hombrechtikon",
         platform="kirchenweb",
     ),
     SourceConfig(

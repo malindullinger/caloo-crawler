@@ -19,6 +19,7 @@ Classification: Tier A (structured ISO timestamps found on detail pages)
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import List
@@ -222,6 +223,9 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
             txt = article.get_text(" ", strip=True)
             description_raw = txt[:2000] if txt else None
 
+        # ── Organiser from JSON-LD ────────────────────────────
+        organiser_info = self._extract_organiser_jsonld(soup)
+
         return ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,
@@ -233,6 +237,7 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
                 "categories": categories,
+                **(organiser_info or {}),
             },
             fetched_at=self.now_utc(),
         )
@@ -309,3 +314,24 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
                     categories.append(text)
 
         return categories
+
+    @staticmethod
+    def _extract_organiser_jsonld(soup: BeautifulSoup) -> dict | None:
+        """Extract organiser from JSON-LD Event markup."""
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.get_text() or "")
+                items = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for item in items:
+                    if isinstance(item, dict) and item.get("@type") == "Event":
+                        org = item.get("organizer")
+                        if isinstance(org, dict):
+                            name = (org.get("name") or "").strip()
+                            url = (org.get("url") or "").strip()
+                            if name:
+                                return {"organiser": {"name": name, **({"url": url} if url else {})}}
+                        elif isinstance(org, str) and org.strip():
+                            return {"organiser": {"name": org.strip()}}
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        return None
