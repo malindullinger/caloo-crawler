@@ -105,9 +105,11 @@ class MaennedorfPortalAdapter(BaseAdapter):
             detail_urls.append(abs_url)
 
         # Respect max_items
+        pre_truncation_count = len(detail_urls)
         detail_urls = detail_urls[: cfg.max_items]
 
         print("MaennedorfPortalAdapter: detail_urls:", len(detail_urls))
+        print(f"MaennedorfPortalAdapter [{cfg.source_id}]: DOM-visible={pre_truncation_count}, after max_items({cfg.max_items})={len(detail_urls)}, truncated={pre_truncation_count > len(detail_urls)}")
         if detail_urls:
             print("MaennedorfPortalAdapter: first detail url:", detail_urls[0])
 
@@ -118,6 +120,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
             detail_urls,
             lambda url: self._extract_from_detail(cfg, url),
             adapter_name="MaennedorfPortalAdapter",
+            circuit_breaker_threshold=15,
         )
 
         print("MaennedorfPortalAdapter: items built:", len(items))
@@ -139,6 +142,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
         if not title:
             title = extract_title(soup, strip_title_suffix=" - ")
         if not title:
+            print(f"MaennedorfPortalAdapter [{cfg.source_id}]: no title extracted — {detail_url}")
             return None
 
         # Lead container for location + fallback datetime extraction
@@ -208,6 +212,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
 
         # RawEvent requires datetime_raw to be a string
         if not datetime_raw:
+            print(f"MaennedorfPortalAdapter [{cfg.source_id}]: no datetime extracted — {detail_url} (title: {title!r})")
             return None
 
         # Optional description: keep it short

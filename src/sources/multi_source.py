@@ -26,7 +26,7 @@ SOURCES: List[SourceConfig] = [
         adapter="maennedorf_portal",
         seed_url="https://www.maennedorf.ch/anlaesseaktuelles?datumVon=22.01.2026&datumBis=30.12.2026",
         timezone="Europe/Zurich",
-        max_items=50,
+        max_items=200,
         municipality="maennedorf",
         platform="icms",
     ),
@@ -63,8 +63,35 @@ SOURCES: List[SourceConfig] = [
         adapter="maennedorf_portal",  # identical ICMS platform
         seed_url="https://www.meilen.ch/anlaesseaktuelles",
         timezone="Europe/Zurich",
-        max_items=50,
+        max_items=400,
         municipality="meilen",
+        platform="icms",
+    ),
+    SourceConfig(
+        source_id="zollikon-portal",
+        adapter="maennedorf_portal",  # identical ICMS platform
+        seed_url="https://www.zollikon.ch/anlaesseaktuelles",
+        timezone="Europe/Zurich",
+        max_items=300,
+        municipality="zollikon",
+        platform="icms",
+    ),
+    SourceConfig(
+        source_id="uetikon-portal",
+        adapter="maennedorf_portal",  # identical ICMS platform
+        seed_url="https://www.uetikonamsee.ch/anlaesseaktuelles",
+        timezone="Europe/Zurich",
+        max_items=150,
+        municipality="uetikon",
+        platform="icms",
+    ),
+    SourceConfig(
+        source_id="rapperswil-jona-portal",
+        adapter="maennedorf_portal",  # identical ICMS platform
+        seed_url="https://www.rapperswil-jona.ch/anlaesseaktuelles",
+        timezone="Europe/Zurich",
+        max_items=300,
+        municipality="rapperswil-jona",
         platform="icms",
     ),
     SourceConfig(
