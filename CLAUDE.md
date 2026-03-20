@@ -33,7 +33,7 @@ Frontend may query ONLY:
 - `public.feed_cards_view`
 
 Other views that exist are not feed sources:
-- `public.source_document_latest` (crawler/source support only)
+- `public.source_current` (crawler/source support only, renamed from source_document_latest in 6H)
 
 Do NOT create or revive any:
 - `events_lovable_v*`, `events_lovable_cards_v*`, `this_weekend_*`, `event_feed_cards`, `public_events_v*`, etc.

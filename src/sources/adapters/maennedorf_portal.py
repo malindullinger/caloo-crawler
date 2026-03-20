@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
-from ..extraction import extract_title
+from ..extraction import extract_title, extract_image, extract_description
 from ..http import http_get
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
@@ -46,9 +46,13 @@ class MaennedorfPortalAdapter(BaseAdapter):
     """
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
+        # Surface tracking: single listing page
+        self._surfaces_attempted = 1
+
         res = http_get(cfg.seed_url, render_js=True)
         html = res.text or ""
 
+        self._surfaces_succeeded = 1
         soup = BeautifulSoup(html, "html.parser")
 
         # ----------------------------
@@ -106,6 +110,8 @@ class MaennedorfPortalAdapter(BaseAdapter):
 
         # Respect max_items
         pre_truncation_count = len(detail_urls)
+        self._dom_items_visible = pre_truncation_count
+        self._detail_urls_found = pre_truncation_count
         detail_urls = detail_urls[: cfg.max_items]
 
         print("MaennedorfPortalAdapter: detail_urls:", len(detail_urls))
@@ -215,12 +221,16 @@ class MaennedorfPortalAdapter(BaseAdapter):
             print(f"MaennedorfPortalAdapter [{cfg.source_id}]: no datetime extracted — {detail_url} (title: {title!r})")
             return None
 
-        # Optional description: keep it short
-        description_raw = None
-        main = soup.select_one("main") or soup.select_one(".content") or soup.select_one("article")
-        if main:
-            txt = main.get_text(" ", strip=True)
-            description_raw = txt[:2000] if txt else None
+        # Description: shared helper → fallback to main content block
+        description_raw = extract_description(soup, max_length=4000)
+        if not description_raw:
+            main = soup.select_one("main") or soup.select_one(".content") or soup.select_one("article")
+            if main:
+                txt = main.get_text(" ", strip=True)
+                description_raw = txt[:4000] if txt else None
+
+        # Image
+        image_url = extract_image(soup, page_url=detail_url)
 
         return ExtractedItem(
             title_raw=title,
@@ -232,6 +242,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
                 "adapter": "maennedorf_portal",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
+                **({"image_url": image_url} if image_url else {}),
             },
             fetched_at=getattr(cfg, "now_utc", None),
         )

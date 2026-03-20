@@ -214,9 +214,16 @@ class RefKircheMaennedorfAdapter(BaseAdapter):
     """
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
+        # Surface tracking: listing page + ICS feed (conceptual surface)
+        self._surfaces_attempted = 2  # listing page + ICS download
+
         # Phase 1: fetch listing page and discover ICS download URLs
         ics_urls = self._discover_ics_urls(cfg)
         print(f"RefKircheMaennedorfAdapter: {len(ics_urls)} ICS URLs discovered")
+
+        # Listing succeeded if we got any ICS URLs
+        self._surfaces_succeeded = 1 if ics_urls else 0
+        self._detail_urls_found = len(ics_urls)
 
         # Respect max_items (before filtering — we want the full picture)
         ics_urls = ics_urls[: cfg.max_items]
@@ -245,11 +252,18 @@ class RefKircheMaennedorfAdapter(BaseAdapter):
                         f"{consecutive_http_failures} consecutive HTTP failures, "
                         f"aborting {remaining} remaining ICS fetches"
                     )
+                    self._circuit_breaker_triggered = True
                     break
 
             # Polite delay every 20 requests
             if (i + 1) % 20 == 0 and i + 1 < len(ics_urls):
                 time.sleep(0.5)
+
+        # ICS surface succeeded if we parsed at least one event
+        total_parsed = stats["include"] + stats["exclude"] + stats["review"]
+        if total_parsed > 0:
+            self._surfaces_succeeded = 2  # both listing + ICS succeeded
+        self._detail_urls_fetched = stats["include"] + stats["exclude"] + stats["review"] + stats["parse_fail"]
 
         # Phase 3: print relevance report
         total = stats["include"] + stats["exclude"] + stats["review"]

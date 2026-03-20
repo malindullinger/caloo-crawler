@@ -56,8 +56,16 @@ class FluugepilzAdapter(BaseAdapter):
     """
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
+        # Surface tracking: single RSS feed
+        self._surfaces_attempted = 1
+
         res = http_get(cfg.seed_url)
         items = self._parse_rss(res.text or "", cfg)
+
+        self._surfaces_succeeded = 1 if items else 0
+        self._detail_urls_found = len(items)
+        self._detail_urls_fetched = len(items)
+
         print(f"FluugepilzAdapter: {len(items)} items extracted from RSS feed")
         return items
 

@@ -24,7 +24,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
-from ..extraction import extract_title
+from ..extraction import extract_title, extract_image, extract_description
 from ..http import http_get
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
@@ -36,14 +36,21 @@ class EventbriteAdapter(BaseAdapter):
     """
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
+        # Surface tracking: single listing page
+        self._surfaces_attempted = 1
+
         # Fetch listing page
         res = http_get(cfg.seed_url)
         html = res.text or ""
         soup = BeautifulSoup(html, "html.parser")
 
+        self._surfaces_succeeded = 1
+
         # Extract event detail URLs from listing
         detail_urls = self._extract_event_urls(soup, cfg.seed_url)
         print(f"EventbriteAdapter: found {len(detail_urls)} event URLs")
+
+        self._detail_urls_found = len(detail_urls)
 
         # Limit to max_items
         detail_urls = detail_urls[: cfg.max_items]
@@ -115,8 +122,14 @@ class EventbriteAdapter(BaseAdapter):
         else:
             location_raw = self._extract_location_text(soup)
 
-        # Get description
-        description_raw = self._get_description(soup)
+        # Description: prefer full body content, fall back to meta
+        description_raw = extract_description(
+            soup,
+            primary_selector=".structured-content-rich-text",
+        ) or self._get_description(soup)
+
+        # Image: og:image → JSON-LD → first content <img>
+        image_url = extract_image(soup, page_url=detail_url)
 
         # Organiser from JSON-LD
         organiser_info = self._get_organiser_from_jsonld(soup) if extraction_method == "jsonld" else None
@@ -132,6 +145,7 @@ class EventbriteAdapter(BaseAdapter):
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
                 **(organiser_info or {}),
+                **({"image_url": image_url} if image_url else {}),
             },
             fetched_at=datetime.now(timezone.utc),
         )

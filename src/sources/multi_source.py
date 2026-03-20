@@ -3,12 +3,41 @@ from __future__ import annotations
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List
+from typing import Dict, List, Optional
 
 from .registry import get_adapter
 from .types import SourceConfig, ExtractedItem
 from ..models import RawEvent
+from ..storage import insert_crawl_run, finish_crawl_run
+
+
+@dataclass
+class SourceCrawlMetrics:
+    surfaces_attempted: int = 0
+    surfaces_succeeded: int = 0
+    dom_items_visible: int = 0
+    detail_urls_found: int = 0
+    detail_urls_fetched: int = 0
+    items_extracted: int = 0
+    items_failed: int = 0
+    items_skipped: int = 0
+    circuit_breaker_triggered: bool = False
+
+
+@dataclass
+class SourceCrawlResult:
+    source_id: str
+    raw_events: List[RawEvent]
+    crawl_run_id: Optional[str]
+    metrics: SourceCrawlMetrics
+
+
+@dataclass
+class CrawlBatchResult:
+    all_raw_events: List[RawEvent]
+    source_results: Dict[str, SourceCrawlResult] = field(default_factory=dict)
 
 # Parallelization config
 MAX_WORKERS = 4           # concurrent source threads (each source = different domain)
@@ -256,50 +285,104 @@ def _validate_sources(sources: List[SourceConfig]) -> None:
     print("[crawl] source manifest validation passed")
 
 
-def _process_source(cfg: SourceConfig, now: datetime) -> List[RawEvent]:
+def _process_source(cfg: SourceConfig, now: datetime) -> SourceCrawlResult:
     """Process a single source: fetch, enrich, convert to RawEvent.
 
     Runs in a worker thread. Each source targets a different domain,
     so concurrent execution does not violate per-domain politeness.
+    Returns SourceCrawlResult (never raises — failures are captured in metrics).
     """
     t0 = time.monotonic()
     print(f"[crawl] {cfg.source_id} — started")
 
-    adapter = get_adapter(cfg.adapter)
-    items: List[ExtractedItem] = adapter.fetch(cfg)
+    # Start crawl run
+    crawl_run_id: Optional[str] = None
+    try:
+        crawl_run_id = insert_crawl_run(cfg.source_id)
+    except Exception as e:
+        print(f"[crawl] {cfg.source_id} — insert_crawl_run failed: {repr(e)}")
 
-    # Enrich each item (detail fetch fallback)
-    enriched: List[ExtractedItem] = []
-    for it in items:
-        it.fetched_at = it.fetched_at or now
-        enriched.append(adapter.enrich(cfg, it))
+    metrics = SourceCrawlMetrics()
+    status = "completed"
+    error_msg: Optional[str] = None
+    raw_events: List[RawEvent] = []
 
-    # Convert to RawEvent
-    result: List[RawEvent] = []
-    for it in enriched:
-        result.append(
-            RawEvent(
-                source_id=cfg.source_id,
-                source_url=cfg.seed_url,
-                item_url=it.item_url,
-                title_raw=it.title_raw,
-                datetime_raw=it.datetime_raw,
-                location_raw=it.location_raw,
-                description_raw=it.description_raw,
-                extra=it.extra or {},
-                fetched_at=it.fetched_at or now,
+    try:
+        adapter = get_adapter(cfg.adapter)
+        items: List[ExtractedItem] = adapter.fetch(cfg)
+
+        # Read metrics from adapter instance
+        metrics.surfaces_attempted = adapter._surfaces_attempted
+        metrics.surfaces_succeeded = adapter._surfaces_succeeded
+        metrics.dom_items_visible = adapter._dom_items_visible
+        metrics.detail_urls_found = adapter._detail_urls_found
+        metrics.detail_urls_fetched = adapter._detail_urls_fetched
+        metrics.circuit_breaker_triggered = adapter._circuit_breaker_triggered
+
+        # Enrich each item (detail fetch fallback)
+        enriched: List[ExtractedItem] = []
+        for it in items:
+            it.fetched_at = it.fetched_at or now
+            enriched.append(adapter.enrich(cfg, it))
+
+        # Convert to RawEvent
+        for it in enriched:
+            raw_events.append(
+                RawEvent(
+                    source_id=cfg.source_id,
+                    source_url=cfg.seed_url,
+                    item_url=it.item_url,
+                    title_raw=it.title_raw,
+                    datetime_raw=it.datetime_raw,
+                    location_raw=it.location_raw,
+                    description_raw=it.description_raw,
+                    extra=it.extra or {},
+                    fetched_at=it.fetched_at or now,
+                )
             )
-        )
+
+        metrics.items_extracted = len(raw_events)
+    except Exception as e:
+        status = "failed"
+        error_msg = repr(e)[:500]
+        print(f"[crawl] {cfg.source_id} — FAILED: {error_msg}")
+        traceback.print_exc()
+    finally:
+        # Always finish crawl run (even on failure)
+        if crawl_run_id:
+            try:
+                finish_crawl_run(
+                    crawl_run_id,
+                    status=status,
+                    surfaces_attempted=metrics.surfaces_attempted,
+                    surfaces_succeeded=metrics.surfaces_succeeded,
+                    dom_items_visible=metrics.dom_items_visible,
+                    detail_urls_found=metrics.detail_urls_found,
+                    detail_urls_fetched=metrics.detail_urls_fetched,
+                    items_extracted=metrics.items_extracted,
+                    items_failed=metrics.items_failed,
+                    items_skipped=metrics.items_skipped,
+                    circuit_breaker_triggered=metrics.circuit_breaker_triggered,
+                    error_message=error_msg,
+                )
+            except Exception as fin_err:
+                print(f"[crawl] {cfg.source_id} — finish_crawl_run failed: {repr(fin_err)}")
 
     elapsed = time.monotonic() - t0
-    print(f"[crawl] {cfg.source_id} — completed: {len(result)} items in {elapsed:.1f}s")
-    return result
+    print(f"[crawl] {cfg.source_id} — done: {len(raw_events)} items in {elapsed:.1f}s")
+    return SourceCrawlResult(
+        source_id=cfg.source_id,
+        raw_events=raw_events,
+        crawl_run_id=crawl_run_id,
+        metrics=metrics,
+    )
 
 
-def fetch_and_extract() -> List[RawEvent]:
+def fetch_and_extract() -> CrawlBatchResult:
     _validate_sources(SOURCES)
     now = datetime.now(timezone.utc)
     out: List[RawEvent] = []
+    source_results: Dict[str, SourceCrawlResult] = {}
     t_start = time.monotonic()
 
     # Log disabled sources
@@ -324,12 +407,13 @@ def fetch_and_extract() -> List[RawEvent]:
         for future in as_completed(futures, timeout=TOTAL_TIMEOUT_S):
             cfg = futures[future]
             try:
-                result = future.result()  # already complete — returns immediately
-                source_counts[cfg.source_id] = len(result)
-                out.extend(result)
+                result: SourceCrawlResult = future.result()
+                source_results[cfg.source_id] = result
+                source_counts[cfg.source_id] = len(result.raw_events)
+                out.extend(result.raw_events)
             except Exception:
                 source_counts[cfg.source_id] = -1  # -1 = failed
-                print(f"[crawl] {cfg.source_id} — FAILED")
+                print(f"[crawl] {cfg.source_id} — future.result() raised unexpectedly")
                 traceback.print_exc()
     except TimeoutError:
         elapsed = time.monotonic() - t_start
@@ -353,4 +437,4 @@ def fetch_and_extract() -> List[RawEvent]:
 
     elapsed = time.monotonic() - t_start
     print(f"[crawl] all sources done: {len(out)} total items in {elapsed:.1f}s")
-    return out
+    return CrawlBatchResult(all_raw_events=out, source_results=source_results)

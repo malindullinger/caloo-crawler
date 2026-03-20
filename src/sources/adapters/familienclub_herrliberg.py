@@ -28,6 +28,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
+from ..extraction import extract_image, extract_description
 from ..http import http_get
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
@@ -75,6 +76,8 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
         # ── Phase 1: Discover detail URLs across paginated agenda ──────
         detail_urls = self._discover_all_detail_urls(cfg)
 
+        self._detail_urls_found = len(detail_urls)
+
         # Respect max_items
         detail_urls = detail_urls[: cfg.max_items]
 
@@ -102,8 +105,11 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
         seen: set[str] = set()
         ordered: List[str] = []
         url_limit = cfg.max_items * 2  # generous buffer before dedup
+        pages_attempted = 0
+        pages_succeeded = 0
 
         for page_num in range(_MAX_PAGES):
+            pages_attempted += 1
             # Build page URL
             if page_num == 0:
                 page_url = cfg.seed_url
@@ -115,6 +121,7 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
             try:
                 res = http_get(page_url)
                 html = res.text or ""
+                pages_succeeded += 1
             except Exception as e:
                 print(f"[herrliberg] Page {page_num} fetch failed: {repr(e)}")
                 break
@@ -145,6 +152,9 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
                 time.sleep(_PAGE_DELAY_S)
 
         print(f"[herrliberg] Discovery complete: {len(ordered)} unique detail URLs from {min(page_num + 1, _MAX_PAGES)} pages")
+        # Surface tracking: listing + pagination as one combined surface
+        self._surfaces_attempted = 1 + (1 if pages_attempted > 1 else 0)
+        self._surfaces_succeeded = (1 if pages_succeeded > 0 else 0) + (1 if pages_succeeded > 1 else 0)
         return ordered
 
     def enrich(self, cfg: SourceConfig, item: ExtractedItem) -> ExtractedItem:
@@ -217,11 +227,17 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
         categories = self._extract_categories(soup)
 
         # ── Description ───────────────────────────────────────
-        description_raw = None
-        article = soup.find("article") or soup.select_one(".entry-content")
-        if article:
-            txt = article.get_text(" ", strip=True)
-            description_raw = txt[:2000] if txt else None
+        description_raw = extract_description(
+            soup, primary_selector=".entry-content", max_length=4000,
+        )
+        if not description_raw:
+            article = soup.find("article") or soup.select_one(".entry-content")
+            if article:
+                txt = article.get_text(" ", strip=True)
+                description_raw = txt[:4000] if txt else None
+
+        # ── Image ────────────────────────────────────────────
+        image_url = extract_image(soup, page_url=detail_url)
 
         # ── Organiser from JSON-LD ────────────────────────────
         organiser_info = self._extract_organiser_jsonld(soup)
@@ -238,6 +254,7 @@ class FamilienclubHerrlibergAdapter(BaseAdapter):
                 "extraction_method": extraction_method,
                 "categories": categories,
                 **(organiser_info or {}),
+                **({"image_url": image_url} if image_url else {}),
             },
             fetched_at=self.now_utc(),
         )

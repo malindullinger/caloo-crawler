@@ -2,26 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
-from datetime import date as Date
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
-from zoneinfo import ZoneInfo
-
-import dateparser
 from supabase import create_client
 
 from .config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
-from .models import NormalizedEvent, RawEvent
+from .models import RawEvent
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 T = TypeVar("T")
 
-_MAX_RETRIES = 2
-_RETRY_DELAY_S = 1.0
+_MAX_RETRIES = 3
+_RETRY_DELAY_S = 2.0
 
 
 def _with_retry(fn: Callable[[], T], label: str) -> T:
@@ -33,9 +28,13 @@ def _with_retry(fn: Callable[[], T], label: str) -> T:
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
-            is_transient = any(
+            is_transient = isinstance(e, (ConnectionError, OSError)) or any(
                 kw in err_str
-                for kw in ("timeout", "connection", "502", "503", "504", "rate")
+                for kw in (
+                    "timeout", "connection", "502", "503", "504", "rate",
+                    "reset", "broken pipe", "eof", "temporary failure",
+                    "network", "unreachable",
+                )
             )
             if not is_transient or attempt >= _MAX_RETRIES:
                 raise
@@ -85,213 +84,79 @@ def store_raw(raw: RawEvent) -> None:
     )
 
 
-# ----------------------------
-# NORMALIZED EVENTS
-# ----------------------------
-def upsert_event(ev: NormalizedEvent) -> None:
-    now = datetime.now(timezone.utc)
 
+# Legacy upsert_event and insert_schedules removed in Phase 6H.1.
+# Pipeline now writes only to event_raw (store_raw).
+# Canonical path: event_raw → ingestRaw.ts → source_record → transformCanonical.ts → happening/offering/occurrence.
+
+
+# ----------------------------
+# CRAWL RUNS (PHASE 6G)
+# ----------------------------
+def insert_crawl_run(source_id: str) -> str:
+    """Insert a crawl_runs row with status='running'. Returns the run id (uuid)."""
     row = {
-        "external_id": ev.external_id,
-        "source_id": ev.source_id,
-        "title": ev.title,
-        "start_at": ev.start_at.astimezone(timezone.utc).isoformat(),
-        "end_at": ev.end_at.astimezone(timezone.utc).isoformat() if ev.end_at else None,
-        "timezone": ev.timezone,
-        "location_name": ev.location_name,
-        "description": ev.description,
-        "canonical_url": ev.canonical_url,
-        "last_seen_at": ev.last_seen_at.astimezone(timezone.utc).isoformat(),
-        "updated_at": now.isoformat(),
-        "event_type": ev.event_type,
-        "is_all_day": ev.is_all_day,
-        "date_precision": ev.date_precision,
+        "source_id": source_id,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
     }
+    result = _with_retry(
+        lambda: supabase.table("crawl_runs").insert(row).execute(),
+        f"insert_crawl_run({source_id})",
+    )
+    return result.data[0]["id"]
 
-    # Safety: canonical_url is guaranteed unique per event since normalize.py
-    # appends #evt-{external_id[:16]} when item_url is missing.
-    # This prevents silent overwrites for events sharing the same source_url.
+
+def finish_crawl_run(
+    run_id: str,
+    *,
+    status: str = "completed",
+    surfaces_attempted: int = 0,
+    surfaces_succeeded: int = 0,
+    dom_items_visible: int = 0,
+    detail_urls_found: int = 0,
+    detail_urls_fetched: int = 0,
+    items_extracted: int = 0,
+    items_failed: int = 0,
+    items_skipped: int = 0,
+    circuit_breaker_triggered: bool = False,
+    error_message: Optional[str] = None,
+) -> None:
+    """Update a crawl_runs row with final metrics and status."""
+    row = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "surfaces_attempted": surfaces_attempted,
+        "surfaces_succeeded": surfaces_succeeded,
+        "dom_items_visible": dom_items_visible,
+        "detail_urls_found": detail_urls_found,
+        "detail_urls_fetched": detail_urls_fetched,
+        "items_extracted": items_extracted,
+        "items_failed": items_failed,
+        "items_skipped": items_skipped,
+        "circuit_breaker_triggered": circuit_breaker_triggered,
+        "error_message": error_message,
+    }
     _with_retry(
-        lambda: supabase.table("events").upsert(row, on_conflict="source_id,canonical_url").execute(),
-        f"upsert_event({ev.source_id})",
+        lambda: supabase.table("crawl_runs").update(row).eq("id", run_id).execute(),
+        f"finish_crawl_run({run_id[:8]})",
     )
 
 
-# ----------------------------
-# EVENT SCHEDULES (PHASE 3)
-# ----------------------------
-def insert_schedules(
-    *,
-    event_external_id: str,
-    raw_datetime: Optional[str],
-    event_type: str,
-    event_start_at_utc: datetime,
-    event_tz: str,
-    event_end_at_utc: Optional[datetime] = None,  # accepts pipeline arg safely
-) -> None:
-    """
-    Writes ONE schedule row per event:
-    - date_range => schedule_type='window'
-        start_date_local / end_date_local from raw range,
-        start_time_local / end_time_local from raw time window if present
-    - single => schedule_type='session'
-        start_date_local + start_time_local from normalized start_at,
-        end_time_local from raw if present
-
-    IMPORTANT GUARD:
-      - If event_type == 'single' BUT normalized time is 00:00 (date-only),
-        we SKIP writing a session row to avoid duplicates / bogus sessions.
-    """
-
-    raw_s = (raw_datetime or "").strip()
-    tz = ZoneInfo(event_tz)
-
-    # Times like: "14.00", "14:00" optionally followed by "Uhr"
-    _TIME_RE = re.compile(r"(\d{1,2})[.:](\d{2})(?:\s*Uhr)?", re.IGNORECASE)
-
-    def _extract_time_window(s: str) -> tuple[Optional[str], Optional[str]]:
-        hits = _TIME_RE.findall(s or "")
-        if not hits:
-            return None, None
-
-        sh, sm = hits[0]
-        start_t = f"{int(sh):02d}:{int(sm):02d}"
-
-        end_t = None
-        if len(hits) >= 2:
-            eh, em = hits[1]
-            end_t = f"{int(eh):02d}:{int(em):02d}"
-
-        return start_t, end_t
-
-    def _parse_date_any(s: str) -> Optional[Date]:
-        """
-        Accepts:
-          - '06.01.2026'
-          - '6. Jan. 2026'
-          - '10. Feb. 2026'
-        Returns datetime.date
-        """
-        s = (s or "").strip()
-        if not s:
-            return None
-
-        dt = dateparser.parse(
-            s,
-            languages=["de", "en"],
-            settings={
-                "TIMEZONE": event_tz,
-                "RETURN_AS_TIMEZONE_AWARE": True,
-                "PREFER_DATES_FROM": "future",
-                "DATE_ORDER": "DMY",
-            },
-        )
-        return dt.date() if dt else None
-
-    # -----------------------------------------
-    # 1) Date ranges => window
-    # -----------------------------------------
-    if event_type == "date_range":
-        start_date_local: Optional[Date] = None
-        end_date_local: Optional[Date] = None
-
-        # Use the part before the first comma as the "date range"
-        # e.g. "6. Jan. 2026 - 10. Feb. 2026, 14.00 Uhr - 14.45 Uhr, ..."
-        range_part = raw_s.split(",", 1)[0].strip()
-
-        # Split by dash
-        if " - " in range_part:
-            left, right = range_part.split(" - ", 1)
-            start_date_local = _parse_date_any(left)
-            end_date_local = _parse_date_any(right)
-        else:
-            # Single-date strings like "11. Juli 2026, 9.30 Uhr - 16.00 Uhr"
-            # We treat them as a 1-day window.
-            only_date = _parse_date_any(range_part)
-            if only_date:
-                start_date_local = only_date
-                end_date_local = only_date
-
-        # If dates still missing, fall back to normalized event bounds
-        if not start_date_local:
-            start_date_local = event_start_at_utc.astimezone(tz).date()
-        if not end_date_local:
-            if event_end_at_utc:
-                end_date_local = event_end_at_utc.astimezone(tz).date()
-            else:
-                # at least keep it non-null when we can’t parse
-                end_date_local = start_date_local
-
-        # Extract time window (if present)
-        start_time_local, end_time_local = _extract_time_window(raw_s)
-
-        # If raw has no time but normalized start has a meaningful time, use it
-        if not start_time_local:
-            start_local = event_start_at_utc.astimezone(tz)
-            if not (start_local.hour == 0 and start_local.minute == 0):
-                start_time_local = start_local.strftime("%H:%M")
-
-        row = {
-            "event_external_id": event_external_id,
-            "schedule_type": "window",
-            "start_date_local": start_date_local.isoformat() if start_date_local else None,
-            "end_date_local": end_date_local.isoformat() if end_date_local else None,
-            "start_time_local": start_time_local,
-            "end_time_local": end_time_local,
-            "notes": f"date_range_raw={raw_s}",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        _with_retry(
-            lambda: supabase.table("event_schedules").upsert(
-                row,
-                on_conflict="event_external_id,schedule_type",
-            ).execute(),
-            f"schedule_window({event_external_id[:12]})",
-        )
+def insert_crawl_run_items(run_id: str, item_keys: List[str]) -> None:
+    """Bulk insert item keys for a crawl run. Deduplicates keys."""
+    if not item_keys:
         return
 
-    # -----------------------------------------
-    # 2) Singles => session
-    # -----------------------------------------
-    if event_type == "single":
-        start_local = event_start_at_utc.astimezone(tz)
+    unique_keys = list(dict.fromkeys(item_keys))  # preserve order, dedupe
+    rows = [{"crawl_run_id": run_id, "item_key": key} for key in unique_keys]
 
-        # ✅ Guard: avoid generating bogus midnight sessions
-        # These were previously created by "backfill_from_events_start_at=true"
-        # when the normalized event had date-only precision.
-        if start_local.hour == 0 and start_local.minute == 0:
-            return
-
-        start_date_local = start_local.date().isoformat()
-        start_time_local = start_local.strftime("%H:%M")
-
-        # End time from raw string if present (second time)
-        end_time_local = None
-        hits = _TIME_RE.findall(raw_s)
-        if len(hits) >= 2:
-            eh, em = hits[1]
-            end_time_local = f"{int(eh):02d}:{int(em):02d}"
-
-        row = {
-            "event_external_id": event_external_id,
-            "schedule_type": "session",
-            "start_date_local": start_date_local,
-            "end_date_local": None,
-            "start_time_local": start_time_local,
-            "end_time_local": end_time_local,
-            "notes": f"single_raw={raw_s}",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
+    BATCH_SIZE = 500
+    for i in range(0, len(rows), BATCH_SIZE):
+        batch = rows[i : i + BATCH_SIZE]
         _with_retry(
-            lambda: supabase.table("event_schedules").upsert(
-                row,
-                on_conflict="event_external_id,schedule_type",
-            ).execute(),
-            f"schedule_session({event_external_id[:12]})",
+            lambda b=batch: supabase.table("crawl_run_items")
+                .upsert(b, on_conflict="crawl_run_id,item_key")
+                .execute(),
+            f"insert_crawl_run_items({run_id[:8]}, batch {i // BATCH_SIZE + 1})",
         )
-        return
-
-    # Other types => do nothing for now
-    return

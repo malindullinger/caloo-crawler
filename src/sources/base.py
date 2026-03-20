@@ -9,6 +9,16 @@ from .types import SourceConfig, ExtractedItem
 
 
 class BaseAdapter(ABC):
+    def __init__(self) -> None:
+        # Surface tracking (set by each adapter's fetch())
+        self._surfaces_attempted: int = 0
+        self._surfaces_succeeded: int = 0
+        self._dom_items_visible: int = 0
+        self._detail_urls_found: int = 0
+        # Detail fetch tracking (set by _fetch_detail_pages())
+        self._detail_urls_fetched: int = 0
+        self._circuit_breaker_triggered: bool = False
+
     @abstractmethod
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
         """Return extracted items (list stage)."""
@@ -46,7 +56,9 @@ class BaseAdapter(ABC):
         """
         items: List[ExtractedItem] = []
         consecutive_failures = 0
+        fetched_count = 0
         for i, url in enumerate(urls):
+            fetched_count = i + 1
             try:
                 item = extract_fn(url)
                 if item:
@@ -66,7 +78,9 @@ class BaseAdapter(ABC):
                     f"{adapter_name}: CIRCUIT BREAKER — {consecutive_failures} consecutive "
                     f"failures, aborting {remaining} remaining detail fetches"
                 )
+                self._circuit_breaker_triggered = True
                 break
             if delay_every and (i + 1) % delay_every == 0 and i + 1 < len(urls):
                 time.sleep(delay_s)
+        self._detail_urls_fetched = fetched_count
         return items

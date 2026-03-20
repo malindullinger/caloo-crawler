@@ -24,7 +24,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
-from ..extraction import extract_title
+from ..extraction import extract_title, extract_image
 from ..http import http_get
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
@@ -52,9 +52,17 @@ class KirchenwebAdapter(BaseAdapter):
         month_urls = self._discover_month_urls(cfg)
         print(f"KirchenwebAdapter: {len(month_urls)} month pages to traverse")
 
+        # Surface tracking: listing page + month pages
+        self._surfaces_attempted = 1 + len(month_urls)
+
         # Phase 2: traverse month pages to collect detail URLs
         detail_urls = self._collect_detail_urls(month_urls, cfg.seed_url)
         print(f"KirchenwebAdapter: {len(detail_urls)} unique detail URLs discovered")
+
+        # Surface tracking: listing always succeeds (we got month_urls from it),
+        # plus count successful month pages (those that yielded detail URLs or didn't error)
+        self._surfaces_succeeded = 1 + self._successful_month_pages
+        self._detail_urls_found = len(detail_urls)
 
         # Respect max_items
         detail_urls = detail_urls[: cfg.max_items]
@@ -106,11 +114,13 @@ class KirchenwebAdapter(BaseAdapter):
         """Traverse month pages and collect unique detail URLs."""
         seen: set[str] = set()
         ordered: List[str] = []
+        self._successful_month_pages = 0
 
         for i, month_url in enumerate(month_urls):
             try:
                 res = http_get(month_url)
                 soup = BeautifulSoup(res.text or "", "html.parser")
+                self._successful_month_pages += 1
             except Exception as e:
                 print(f"KirchenwebAdapter: month page failed: {repr(e)}")
                 continue
@@ -176,15 +186,50 @@ class KirchenwebAdapter(BaseAdapter):
             except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
 
-        # Description: div.vinfobeschreibung
+        # Description: div.vinfobeschreibung → JSON-LD description → og:description
         description_raw = None
         desc_el = soup.select_one("div.vinfobeschreibung")
         if desc_el:
-            txt = desc_el.get_text(" ", strip=True)
+            # Preserve paragraph breaks
+            parts: list[str] = []
+            for child in desc_el.children:
+                if hasattr(child, "get_text"):
+                    txt = child.get_text(" ", strip=True)
+                    if txt:
+                        parts.append(txt)
+                elif hasattr(child, "strip"):
+                    txt = child.strip()
+                    if txt:
+                        parts.append(txt)
+            text = "\n\n".join(parts) if parts else desc_el.get_text(" ", strip=True)
             # Strip leading "Beschreibung" label that kirchenweb prepends
-            if txt.startswith("Beschreibung "):
-                txt = txt[len("Beschreibung "):].strip()
-            description_raw = txt[:2000] if txt else None
+            if text and text.startswith("Beschreibung "):
+                text = text[len("Beschreibung "):].strip()
+            description_raw = text[:4000] if text else None
+
+        # Fallback: JSON-LD description (many kirchenweb pages lack div.vinfobeschreibung)
+        if not description_raw:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    ld = json.loads(script.get_text() or "")
+                    if isinstance(ld, dict) and ld.get("@type") == "Event":
+                        desc = (ld.get("description") or "").strip()
+                        if desc and len(desc) > 10:
+                            description_raw = desc[:4000]
+                            break
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    continue
+
+        # Last fallback: og:description
+        if not description_raw:
+            og = soup.find("meta", property="og:description")
+            if og and (og.get("content") or "").strip():
+                desc = og["content"].strip()
+                if len(desc) > 10:
+                    description_raw = desc[:4000]
+
+        # Image: og:image → JSON-LD → first content <img>
+        image_url = extract_image(soup, page_url=detail_url)
 
         return ExtractedItem(
             title_raw=title,
@@ -197,6 +242,7 @@ class KirchenwebAdapter(BaseAdapter):
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
                 **({"organiser": organiser} if organiser else {}),
+                **({"image_url": image_url} if image_url else {}),
             },
             fetched_at=self.now_utc(),
         )

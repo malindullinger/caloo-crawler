@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
-from ..extraction import extract_title
+from ..extraction import extract_title, extract_image, extract_description
 from ..http import http_get
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
@@ -63,6 +63,8 @@ class GemeindeHerrlibergAdapter(BaseAdapter):
         detail_urls = self._discover_urls_playwright(cfg)
         print(f"GemeindeHerrlibergAdapter: discovered {len(detail_urls)} detail URLs")
 
+        self._detail_urls_found = len(detail_urls)
+
         # Phase 2: fetch each detail page with standard HTTP
         detail_urls = detail_urls[: cfg.max_items]
         items = self._fetch_detail_pages(
@@ -82,6 +84,9 @@ class GemeindeHerrlibergAdapter(BaseAdapter):
 
         seen: set[str] = set()
         ordered: List[str] = []
+
+        pages_attempted = 0
+        pages_succeeded = 0
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -105,8 +110,11 @@ class GemeindeHerrlibergAdapter(BaseAdapter):
                 page.wait_for_timeout(3000)  # let AJAX content render
 
                 for page_num in range(_MAX_PAGES):
+                    pages_attempted += 1
                     # Extract event URLs from current page
                     new_on_page = self._extract_urls_from_page(page, cfg.seed_url, seen)
+                    if new_on_page:
+                        pages_succeeded += 1
                     for u in new_on_page:
                         if u not in seen:
                             seen.add(u)
@@ -137,6 +145,9 @@ class GemeindeHerrlibergAdapter(BaseAdapter):
             finally:
                 browser.close()
 
+        # Surface tracking: listing + pagination
+        self._surfaces_attempted = 1 + (1 if pages_attempted > 1 else 0)
+        self._surfaces_succeeded = (1 if pages_succeeded > 0 else 0) + (1 if pages_succeeded > 1 else 0)
         return ordered
 
     def _extract_urls_from_page(self, page, seed_url: str, already_seen: set[str]) -> List[str]:
@@ -224,12 +235,16 @@ class GemeindeHerrlibergAdapter(BaseAdapter):
         if not datetime_raw:
             return None
 
-        # Description
-        description_raw = None
-        main = soup.select_one("main") or soup.select_one(".content") or soup.select_one("article")
-        if main:
-            txt = main.get_text(" ", strip=True)
-            description_raw = txt[:2000] if txt else None
+        # Description: shared helper → fallback to main content block
+        description_raw = extract_description(soup, max_length=4000)
+        if not description_raw:
+            main = soup.select_one("main") or soup.select_one(".content") or soup.select_one("article")
+            if main:
+                txt = main.get_text(" ", strip=True)
+                description_raw = txt[:4000] if txt else None
+
+        # Image
+        image_url = extract_image(soup, page_url=detail_url)
 
         return ExtractedItem(
             title_raw=title,
@@ -242,6 +257,7 @@ class GemeindeHerrlibergAdapter(BaseAdapter):
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
                 "organizer": organizer_raw,
+                **({"image_url": image_url} if image_url else {}),
             },
             fetched_at=self.now_utc(),
         )

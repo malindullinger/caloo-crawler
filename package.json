@@ -1,6 +1,4 @@
 {
-  "dependencies": {
-    "@supabase/supabase-js": "^2.99.0",
-    "dotenv": "^17.3.1"
-  }
+  "private": true,
+  "description": "Caloo crawler — Python-only. No TS dependencies. All TS scripts moved to caloo in Phase 6H."
 }

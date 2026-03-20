@@ -30,7 +30,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
-from ..extraction import extract_title
+from ..extraction import extract_title, extract_image, extract_description
 from ..http import http_get
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
@@ -64,9 +64,15 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
     """
 
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
+        # Surface tracking: single listing page
+        self._surfaces_attempted = 1
+
         # Phase 1: fetch listing page and extract detail URLs
         detail_urls = self._discover_detail_urls(cfg)
         print(f"FrauenvereinAdapter: {len(detail_urls)} detail URLs discovered")
+
+        self._surfaces_succeeded = 1 if detail_urls else 0
+        self._detail_urls_found = len(detail_urls)
 
         # Respect max_items
         detail_urls = detail_urls[: cfg.max_items]
@@ -129,14 +135,21 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
 
         # Description: div.ce_text (Contao content element)
         description_raw = None
-        desc_el = soup.select_one("div.ce_text")
-        if desc_el:
-            txt = desc_el.get_text(" ", strip=True)
-            description_raw = txt[:2000] if txt else None
+        description_raw = extract_description(
+            soup, primary_selector="div.ce_text", max_length=4000,
+        )
+        if not description_raw:
+            desc_el = soup.select_one("div.ce_text")
+            if desc_el:
+                txt = desc_el.get_text(" ", strip=True)
+                description_raw = txt[:4000] if txt else None
 
         # Location: not structured on this site (embedded in description text)
         # Conservative: leave as None rather than risk incorrect extraction
         location_raw = None
+
+        # Image
+        image_url = extract_image(soup, page_url=detail_url)
 
         # Organiser from JSON-LD @graph
         organiser_info = self._extract_jsonld_organiser(soup)
@@ -152,6 +165,7 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
                 **(organiser_info or {}),
+                **({"image_url": image_url} if image_url else {}),
             },
             fetched_at=self.now_utc(),
         )
