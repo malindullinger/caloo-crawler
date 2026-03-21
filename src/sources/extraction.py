@@ -223,6 +223,8 @@ def extract_description(
         "[data-testid='event-description']",
         ".event-description",
         ".event-details__description",
+        ".rte",
+        ".detail-content",
         "article .entry-content",
         ".structured-content",
         "article",
