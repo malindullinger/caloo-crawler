@@ -62,7 +62,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="eventbrite-zurich",
         adapter="eventbrite",
-        seed_url="https://www.eventbrite.ch/d/switzerland--zurich/events/",
+        seed_url="https://www.eventbrite.ch/b/switzerland--z%C3%BCrich/family-and-education/",
         timezone="Europe/Zurich",
         max_items=20,  # Limited for testing
         municipality="zurich",
@@ -126,7 +126,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-kirche-herrliberg",
         adapter="kirchenweb",
-        seed_url="https://www.ref-herrliberg.ch/agenda?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.ref-herrliberg.ch/agenda?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="herrliberg",
@@ -135,7 +135,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="kath-kirche-herrliberg",
         adapter="kirchenweb",  # identical kirchenweb.ch platform
-        seed_url="https://www.kath-herrliberg.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.kath-herrliberg.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=100,
         municipality="herrliberg",
@@ -144,7 +144,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-kirche-meilen",
         adapter="kirchenweb",  # identical kirchenweb.ch platform
-        seed_url="https://www.ref-meilen.ch/agenda?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.ref-meilen.ch/agenda?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="meilen",
@@ -153,7 +153,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-staefa-hombrechtikon",
         adapter="kirchenweb",  # identical kirchenweb.ch platform
-        seed_url="https://www.ref-staefa-hombrechtikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen",
+        seed_url="https://www.ref-staefa-hombrechtikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="staefa",
@@ -162,7 +162,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-kirche-zollikon-zumikon",
         adapter="kirchenweb",
-        seed_url="https://www.ref-zozu.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.ref-zozu.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="zollikon",
@@ -171,7 +171,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="kath-kirche-zollikon-zumikon",
         adapter="kirchenweb",
-        seed_url="https://www.kath-zollikon-zumikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.kath-zollikon-zumikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="zollikon",
@@ -180,7 +180,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-kirche-kuesnacht",
         adapter="kirchenweb",
-        seed_url="https://www.rkk.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.rkk.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="kuesnacht",
@@ -189,7 +189,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-kirche-erlenbach",
         adapter="kirchenweb",
-        seed_url="https://www.ref-erlenbach.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.ref-erlenbach.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="erlenbach",
@@ -198,7 +198,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="ref-kirche-uetikon",
         adapter="kirchenweb",
-        seed_url="https://www.ref-uetikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.ref-uetikon.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="uetikon",
@@ -207,7 +207,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="kath-pfarrei-staefa",
         adapter="kirchenweb",
-        seed_url="https://www.pfarreistaefa.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.pfarreistaefa.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="staefa",
@@ -216,7 +216,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="kath-pfarrei-hombrechtikon",
         adapter="kirchenweb",
-        seed_url="https://www.pfarreistniklaus.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365",
+        seed_url="https://www.pfarreistniklaus.ch/?page=agenda&sucheDarstellung=agenda&sucheTyp=veranstaltungen&sucheZeitPunkt=today&sucheZeitFenster=365&sucheZielgruppe=Kinder",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="hombrechtikon",

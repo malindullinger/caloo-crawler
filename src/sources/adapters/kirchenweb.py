@@ -19,7 +19,7 @@ import json
 import re
 import time
 from typing import List
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 
@@ -80,9 +80,19 @@ class KirchenwebAdapter(BaseAdapter):
         return items
 
     def _discover_month_urls(self, cfg: SourceConfig) -> List[str]:
-        """Extract month navigation links from the listing page."""
+        """Extract month navigation links from the listing page.
+
+        Preserves sucheZielgruppe params from the seed URL so that
+        audience filtering is maintained across month page traversal.
+        """
         res = http_get(cfg.seed_url)
         soup = BeautifulSoup(res.text or "", "html.parser")
+
+        # Extract audience filter params from seed URL to inject into month URLs
+        seed_params = parse_qs(urlparse(cfg.seed_url).query)
+        filter_params = {
+            k: v for k, v in seed_params.items() if k == "sucheZielgruppe"
+        }
 
         month_urls: List[str] = []
         seen: set[str] = set()
@@ -102,6 +112,18 @@ class KirchenwebAdapter(BaseAdapter):
                 continue
 
             abs_url = urljoin(cfg.seed_url, href)
+
+            # Month navigation links drop filter params — re-inject them
+            if filter_params:
+                parsed = urlparse(abs_url)
+                existing = parse_qs(parsed.query)
+                for k, v in filter_params.items():
+                    if k not in existing:
+                        existing[k] = v
+                abs_url = urlunparse(parsed._replace(
+                    query=urlencode(existing, doseq=True),
+                ))
+
             if abs_url not in seen:
                 seen.add(abs_url)
                 month_urls.append(abs_url)
