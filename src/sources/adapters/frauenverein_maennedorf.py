@@ -30,8 +30,11 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
+from ..content_surfaces import scan_content_surfaces
+from ..detail_fields import scan_detail_fields
 from ..extraction import extract_title, extract_image, extract_description
 from ..http import http_get
+from ..link_classifier import classify_page_links
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
 
@@ -154,6 +157,11 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
         # Organiser from JSON-LD @graph
         organiser_info = self._extract_jsonld_organiser(soup)
 
+        # Content surfaces, detail fields, and link classification
+        surfaces = scan_content_surfaces(soup, detail_url)
+        detail = scan_detail_fields(soup, title=title, description=description_raw)
+        link_cls = classify_page_links(surfaces.get("external_links", []))
+
         return ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,
@@ -166,6 +174,9 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
                 "extraction_method": extraction_method,
                 **(organiser_info or {}),
                 **({"image_url": image_url} if image_url else {}),
+                **{k: v for k, v in surfaces.items() if v},
+                **{k: v for k, v in detail.items() if v},
+                **{k: v for k, v in link_cls.items() if v},
             },
             fetched_at=self.now_utc(),
         )

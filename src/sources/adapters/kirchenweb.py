@@ -24,8 +24,11 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
+from ..content_surfaces import scan_content_surfaces
+from ..detail_fields import scan_detail_fields
 from ..extraction import extract_title, extract_image
 from ..http import http_get
+from ..link_classifier import classify_page_links
 from ..structured_time import extract_datetime_structured
 from ..types import SourceConfig, ExtractedItem
 
@@ -253,6 +256,15 @@ class KirchenwebAdapter(BaseAdapter):
         # Image: og:image → JSON-LD → first content <img>
         image_url = extract_image(soup, page_url=detail_url)
 
+        # Content surface scan (Phase 7C.1)
+        surfaces = scan_content_surfaces(soup, detail_url)
+
+        # Detail field extraction (Phase 7C.2)
+        detail = scan_detail_fields(soup, title=title, description=description_raw)
+
+        # Link classification (Phase 7C.2)
+        link_cls = classify_page_links(surfaces.get("external_links", []))
+
         return ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,
@@ -265,6 +277,9 @@ class KirchenwebAdapter(BaseAdapter):
                 "extraction_method": extraction_method,
                 **({"organiser": organiser} if organiser else {}),
                 **({"image_url": image_url} if image_url else {}),
+                **{k: v for k, v in surfaces.items() if v},
+                **{k: v for k, v in detail.items() if v},
+                **{k: v for k, v in link_cls.items() if v},
             },
             fetched_at=self.now_utc(),
         )

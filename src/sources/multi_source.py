@@ -249,6 +249,45 @@ SOURCES: List[SourceConfig] = [
         municipality="erlenbach",
         platform="wp_events_manager",
     ),
+    # ── ClubDesk sources ─────────────────────────────────────────────
+    SourceConfig(
+        source_id="familienclub-zollikon",
+        adapter="clubdesk",
+        seed_url="https://www.familienclubzollikon.ch/clubdesk/www/familienclub?p=1000053",
+        timezone="Europe/Zurich",
+        max_items=50,
+        municipality="zollikon",
+        platform="clubdesk",
+    ),
+    # ── Lanterne Magique (Zauberlaterne) ─────────────────────────────
+    SourceConfig(
+        source_id="zauberlaterne-maennedorf",
+        adapter="lanterne_magique",
+        seed_url="https://www.lanterne-magique.org/de/clubs/mannedorf/",
+        timezone="Europe/Zurich",
+        max_items=20,
+        municipality="maennedorf",
+        platform="lanterne_magique",
+    ),
+    # ── GOViS portals ────────────────────────────────────────────────
+    SourceConfig(
+        source_id="kuesnacht-portal",
+        adapter="govis",
+        seed_url="https://www.kuesnacht.ch/leben-freizeit/veranstaltungen.page/843",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="kuesnacht",
+        platform="govis",
+    ),
+    SourceConfig(
+        source_id="hombrechtikon-portal",
+        adapter="govis",
+        seed_url="https://www.hombrechtikon.ch/leben/freizeit/veranstaltungskalender.html/228",
+        timezone="Europe/Zurich",
+        max_items=200,
+        municipality="hombrechtikon",
+        platform="govis",
+    ),
 ]
 
 

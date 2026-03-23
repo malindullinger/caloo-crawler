@@ -11,10 +11,16 @@ from .adapters.kirchenweb import KirchenwebAdapter
 from .adapters.frauenverein_maennedorf import FrauenvereinMaennedorfAdapter
 from .adapters.ref_kirche_maennedorf import RefKircheMaennedorfAdapter
 from .adapters.fluugepilz import FluugepilzAdapter
+from .adapters.clubdesk import ClubDeskAdapter
+from .adapters.govis import GovisAdapter
+from .adapters.lanterne_magique import LanterneMagiqueAdapter
 
 
 ADAPTERS: Dict[str, Type[BaseAdapter]] = {
+    "lanterne_magique": LanterneMagiqueAdapter,
     "maennedorf_portal": MaennedorfPortalAdapter,
+    "clubdesk": ClubDeskAdapter,
+    "govis": GovisAdapter,
     "eventbrite": EventbriteAdapter,
     "familienclub_herrliberg": FamilienclubHerrlibergAdapter,
     "gemeinde_herrliberg": GemeindeHerrlibergAdapter,

@@ -4,8 +4,8 @@ Fluugepilz (Familienzentrum Erlenbach) adapter — WordPress Events Manager RSS.
 Strategy:
 - Single RSS fetch: /events/feed/ returns all events (no pagination)
 - Parse date/time/location from <description> CDATA (NOT <pubDate>)
-- No detail page fetching required — all structured data is in the feed
-- No event narrative description available in the feed
+- Fetch each item's detail page to extract description + image
+- Scan detail pages for content surfaces (PDFs, external links)
 
 Description CDATA format (fixed):
   DD/MM/YYYY - HH:MM - HH:MM <br />VenueName <br />Street <br />City
@@ -23,10 +23,16 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from typing import List
+from typing import Dict, List, Optional
+
+from bs4 import BeautifulSoup
 
 from ..base import BaseAdapter
+from ..content_surfaces import scan_content_surfaces
+from ..detail_fields import scan_detail_fields
+from ..extraction import extract_description, extract_image
 from ..http import http_get
+from ..link_classifier import classify_page_links
 from ..types import SourceConfig, ExtractedItem
 
 # Parse: DD/MM/YYYY - HH:MM - HH:MM <br />Venue <br />Street <br />City
@@ -64,10 +70,94 @@ class FluugepilzAdapter(BaseAdapter):
 
         self._surfaces_succeeded = 1 if items else 0
         self._detail_urls_found = len(items)
-        self._detail_urls_fetched = len(items)
+
+        # Phase 2: Enrich items with detail page data (description + image)
+        items = self._enrich_with_detail_pages(items)
 
         print(f"FluugepilzAdapter: {len(items)} items extracted from RSS feed")
         return items
+
+    def _enrich_with_detail_pages(self, items: List[ExtractedItem]) -> List[ExtractedItem]:
+        """Fetch detail pages to add description, image, and content surfaces."""
+        # Collect URLs for items that have a detail page link
+        url_to_items: Dict[str, List[int]] = {}
+        for i, item in enumerate(items):
+            if item.item_url:
+                url_to_items.setdefault(item.item_url, []).append(i)
+
+        if not url_to_items:
+            self._detail_urls_fetched = 0
+            return items
+
+        urls = list(url_to_items.keys())
+
+        # Use _fetch_detail_pages with a lambda that returns detail data
+        detail_results = self._fetch_detail_pages(
+            urls,
+            self._extract_detail_data,
+            adapter_name="FluugepilzAdapter",
+            delay_every=3,
+            delay_s=1.0,
+        )
+
+        # Build lookup: url -> detail data
+        detail_by_url: Dict[str, ExtractedItem] = {}
+        for detail_item in detail_results:
+            if detail_item.item_url:
+                detail_by_url[detail_item.item_url] = detail_item
+
+        # Merge detail data back into RSS items (don't override RSS fields)
+        for item in items:
+            if not item.item_url or item.item_url not in detail_by_url:
+                continue
+
+            detail = detail_by_url[item.item_url]
+
+            # Add description (RSS has none)
+            if detail.description_raw:
+                item.description_raw = detail.description_raw
+
+            # Merge extra fields (image_url, content surfaces)
+            if detail.extra and item.extra:
+                for key in ("image_url", "pdf_urls", "pdf_count", "external_link_count"):
+                    if key in detail.extra:
+                        item.extra[key] = detail.extra[key]
+                item.extra["detail_page_fetched"] = True
+
+        return items
+
+    def _extract_detail_data(self, url: str) -> Optional[ExtractedItem]:
+        """Fetch and extract description + image from a detail page."""
+        res = http_get(url)
+        html = res.text or ""
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        description = extract_description(soup)
+        image_url = extract_image(soup, page_url=url)
+        surfaces = scan_content_surfaces(soup, url)
+        detail = scan_detail_fields(soup, description=description)
+        link_cls = classify_page_links(surfaces.get("external_links", []))
+
+        # Return a lightweight ExtractedItem carrying only enrichment data
+        extra: Dict = {
+            **({"image_url": image_url} if image_url else {}),
+            **{k: v for k, v in surfaces.items() if v},
+            **{k: v for k, v in detail.items() if v},
+            **{k: v for k, v in link_cls.items() if v},
+        }
+
+        return ExtractedItem(
+            title_raw="",  # not used — RSS title takes precedence
+            datetime_raw=None,
+            location_raw=None,
+            description_raw=description,
+            item_url=url,
+            extra=extra,
+            fetched_at=self.now_utc(),
+        )
 
     def _parse_rss(self, xml_text: str, cfg: SourceConfig) -> List[ExtractedItem]:
         """Parse RSS XML and extract events from <item> elements."""
@@ -127,7 +217,7 @@ class FluugepilzAdapter(BaseAdapter):
             title_raw=title,
             datetime_raw=datetime_raw,
             location_raw=location_raw,
-            description_raw=None,  # no narrative in RSS feed
+            description_raw=None,  # enriched later from detail page
             item_url=link or None,
             extra={
                 "adapter": "fluugepilz",

@@ -65,7 +65,19 @@ def _check_suspicious(result: HttpResult) -> None:
 
 def http_get(url: str, *, render_js: bool = False, timeout_s: int = 30) -> HttpResult:
     if not render_js:
-        r = requests.get(url, timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"})
+        import time as _time
+        max_retries = 3
+        for attempt in range(max_retries):
+            r = requests.get(url, timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 429 and attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)  # 5s, 10s backoff
+                print(f"[http] 429 rate limited, retrying in {wait}s: {url}")
+                _time.sleep(wait)
+                continue
+            result = HttpResult(url=r.url, status_code=r.status_code, text=r.text)
+            _check_suspicious(result)
+            return result
+        # Should not reach here, but just in case
         result = HttpResult(url=r.url, status_code=r.status_code, text=r.text)
         _check_suspicious(result)
         return result
