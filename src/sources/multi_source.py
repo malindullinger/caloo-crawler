@@ -288,6 +288,16 @@ SOURCES: List[SourceConfig] = [
         municipality="hombrechtikon",
         platform="govis",
     ),
+    # ── GOViS family sub-pages ──────────────────────────────────────
+    SourceConfig(
+        source_id="familienzentrum-kuesnacht",
+        adapter="govis",
+        seed_url="https://www.kuesnacht.ch/leben-freizeit/kinder-und-familien/familienzentrum.page/841",
+        timezone="Europe/Zurich",
+        max_items=50,
+        municipality="kuesnacht",
+        platform="govis",
+    ),
 ]
 
 

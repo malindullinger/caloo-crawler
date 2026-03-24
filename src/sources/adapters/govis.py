@@ -122,7 +122,7 @@ class GovisAdapter(BaseAdapter):
     def _extract_urls_from_soup(soup: BeautifulSoup, base_url: str, already_seen: set[str]) -> List[str]:
         """Extract event detail URLs from a GOViS listing page."""
         urls: List[str] = []
-        for a in soup.select("li.event-item h2.event-title a[href]"):
+        for a in soup.select("li.event-item .event-title a[href]"):
             href = a.get("href", "").strip()
             if not href:
                 continue
