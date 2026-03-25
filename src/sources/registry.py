@@ -13,10 +13,12 @@ from .adapters.ref_kirche_maennedorf import RefKircheMaennedorfAdapter
 from .adapters.fluugepilz import FluugepilzAdapter
 from .adapters.clubdesk import ClubDeskAdapter
 from .adapters.govis import GovisAdapter
+from .adapters.forum_magazin import ForumMagazinAdapter
 from .adapters.lanterne_magique import LanterneMagiqueAdapter
 
 
 ADAPTERS: Dict[str, Type[BaseAdapter]] = {
+    "forum_magazin": ForumMagazinAdapter,
     "lanterne_magique": LanterneMagiqueAdapter,
     "maennedorf_portal": MaennedorfPortalAdapter,
     "clubdesk": ClubDeskAdapter,

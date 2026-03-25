@@ -298,6 +298,18 @@ SOURCES: List[SourceConfig] = [
         municipality="kuesnacht",
         platform="govis",
     ),
+    # ── Forum Magazin (Catholic parish events) ─────────────────────
+    SourceConfig(
+        source_id="forum-magazin-pfannenstiel",
+        adapter="forum_magazin",
+        seed_url="https://www.forum-magazin.ch/agenda/",
+        timezone="Europe/Zurich",
+        max_items=100,
+        extra={"categories": ["kinder-und-familien", "jugend"], "region": "3"},
+        # municipality intentionally empty: region=3 (Pfannenstiel) covers
+        # multiple municipalities; downstream maps events via venue/location
+        platform="forum_magazin",
+    ),
 ]
 
 
