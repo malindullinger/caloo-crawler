@@ -59,15 +59,9 @@ SOURCES: List[SourceConfig] = [
         municipality="maennedorf",
         platform="icms",
     ),
-    SourceConfig(
-        source_id="eventbrite-zurich",
-        adapter="eventbrite",
-        seed_url="https://www.eventbrite.ch/b/switzerland--z%C3%BCrich/family-and-education/",
-        timezone="Europe/Zurich",
-        max_items=20,  # Limited for testing
-        municipality="zurich",
-        platform="eventbrite",
-    ),
+    # eventbrite-zurich: Disabled 2026-03-26 (Phase 7D Batch 1 cleanup).
+    # Reason: circuit breaker failures, 0 feed-visible events, Tier C aggregator
+    # providing no unique coverage. Can be re-onboarded if Eventbrite becomes valuable.
     SourceConfig(
         source_id="familienclub-herrliberg",
         adapter="familienclub_herrliberg",
@@ -344,6 +338,50 @@ def _validate_sources(sources: List[SourceConfig]) -> None:
             )
 
     print("[crawl] source manifest validation passed")
+
+    # Registry consistency check: compare crawler config against DB sources table.
+    # Warning-only — never blocks crawling. If the DB is unreachable, log and continue.
+    _validate_registry_consistency(sources)
+
+
+def _validate_registry_consistency(sources: List[SourceConfig]) -> None:
+    """Compare crawler SOURCES list against DB sources table.
+
+    Logs structured warnings for any mismatches. Never raises — if the DB
+    query fails, the warning is logged and crawling proceeds normally.
+
+    This guard exists to prevent registry divergence: sources enabled in the
+    DB but missing from the crawler config (ghost sources), or sources in
+    the crawler config but not enabled in the DB.
+    """
+    try:
+        from ..storage import supabase
+
+        result = supabase.table("sources").select("source_id").eq("is_enabled", True).execute()
+        db_enabled: set[str] = {row["source_id"] for row in result.data}
+    except Exception as e:
+        print(f"[crawl] WARN: registry consistency check skipped — DB query failed: {repr(e)}")
+        return
+
+    crawler_enabled: set[str] = {cfg.source_id for cfg in sources if cfg.enabled}
+
+    crawler_only = sorted(crawler_enabled - db_enabled)
+    db_only = sorted(db_enabled - crawler_enabled)
+
+    if not crawler_only and not db_only:
+        print("[crawl] registry consistency: crawler config and DB sources match")
+        return
+
+    if crawler_only:
+        print(
+            f"[crawl] WARN: registry mismatch — in crawler config but not enabled in DB: "
+            f"{crawler_only}"
+        )
+    if db_only:
+        print(
+            f"[crawl] WARN: registry mismatch — enabled in DB but not in crawler config: "
+            f"{db_only}"
+        )
 
 
 def _process_source(cfg: SourceConfig, now: datetime) -> SourceCrawlResult:
