@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 from .registry import get_adapter
 from .types import SourceConfig, ExtractedItem
 from ..models import RawEvent
-from ..storage import insert_crawl_run, finish_crawl_run
+from ..storage import insert_crawl_run, finish_crawl_run, insert_crawl_run_items, item_key
 
 
 @dataclass
@@ -53,7 +53,7 @@ SOURCES: List[SourceConfig] = [
     SourceConfig(
         source_id="maennedorf_portal",
         adapter="maennedorf_portal",
-        seed_url="https://www.maennedorf.ch/anlaesseaktuelles?datumVon=22.01.2026&datumBis=30.12.2026",
+        seed_url="https://www.maennedorf.ch/anlaesseaktuelles",
         timezone="Europe/Zurich",
         max_items=200,
         municipality="maennedorf",
@@ -67,7 +67,7 @@ SOURCES: List[SourceConfig] = [
         adapter="familienclub_herrliberg",
         seed_url="https://familienclub-herrliberg.ch/agenda/",
         timezone="Europe/Zurich",
-        max_items=200,
+        max_items=500,  # Phase 7E: was 200, G10 fail at ratio 2.0 (400 URLs found)
         municipality="herrliberg",
         platform="ai1ec",
     ),
@@ -441,6 +441,19 @@ def _process_source(cfg: SourceConfig, now: datetime) -> SourceCrawlResult:
             )
 
         metrics.items_extracted = len(raw_events)
+
+        # Persist item ledger BEFORE finishing the run. If this fails,
+        # the run must not be marked completed — the exception propagates
+        # to the except block and sets status='failed'.
+        if crawl_run_id and raw_events:
+            keys = [item_key(r) for r in raw_events]
+            try:
+                insert_crawl_run_items(crawl_run_id, keys)
+            except Exception as ledger_err:
+                raise RuntimeError(
+                    f"crawl_run_items persistence failed: {ledger_err!r}"
+                ) from ledger_err
+
     except Exception as e:
         status = "failed"
         error_msg = repr(e)[:500]

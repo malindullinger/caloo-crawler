@@ -1,23 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import traceback
 
 from .sources.multi_source import fetch_and_extract
-from .storage import store_raw, insert_crawl_run_items
-from .models import RawEvent
-
-
-def _item_key(r: RawEvent) -> str:
-    """Derive a stable item key from a RawEvent for crawl_run_items.
-
-    Uses item_url (detail page URL) as primary key.
-    Falls back to hash of source_id + title + datetime for items without URLs.
-    """
-    if r.item_url:
-        return str(r.item_url)
-    sig = f"{r.source_id}|{r.title_raw}|{r.datetime_raw or ''}"
-    return f"hash:{hashlib.sha256(sig.encode()).hexdigest()[:24]}"
+from .storage import store_raw
 
 
 def main() -> None:
@@ -30,20 +16,8 @@ def main() -> None:
     raws = batch.all_raw_events
     print(f"Raw events: {len(raws)}")
 
-    # Collect item keys per source from extracted RawEvent batch
-    # (before downstream processing — reflects extraction truth)
-    source_item_keys: dict[str, list[str]] = {}
-    for r in raws:
-        source_item_keys.setdefault(r.source_id, []).append(_item_key(r))
-
-    # Bulk insert crawl_run_items for each source that has a crawl_run_id
-    for source_id, sr in batch.source_results.items():
-        if sr.crawl_run_id and source_id in source_item_keys:
-            try:
-                insert_crawl_run_items(sr.crawl_run_id, source_item_keys[source_id])
-            except Exception:
-                print(f"[pipeline] insert_crawl_run_items FAILED for {source_id}")
-                traceback.print_exc()
+    # crawl_run_items are now persisted inside _process_source() before
+    # finish_crawl_run(). No item-key recording needed here.
 
     failed_raw = 0
 

@@ -143,6 +143,21 @@ def finish_crawl_run(
     )
 
 
+def item_key(r: RawEvent) -> str:
+    """Derive a stable item key from a RawEvent for crawl_run_items.
+
+    Uses item_url (detail page URL) as primary key.
+    Falls back to hash of source_id + title + datetime for items without URLs.
+
+    This is the single canonical key derivation. All code that computes
+    item keys for crawl_run_items must use this function.
+    """
+    if r.item_url:
+        return str(r.item_url)
+    sig = f"{r.source_id}|{r.title_raw}|{r.datetime_raw or ''}"
+    return f"hash:{hashlib.sha256(sig.encode()).hexdigest()[:24]}"
+
+
 def insert_crawl_run_items(run_id: str, item_keys: List[str]) -> None:
     """Bulk insert item keys for a crawl run. Deduplicates keys."""
     if not item_keys:

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date, timedelta
 from typing import List
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup, NavigableString
 
@@ -67,11 +68,38 @@ class MaennedorfPortalAdapter(BaseAdapter):
     - Extract organizer from <address>
     """
 
+    @staticmethod
+    def _apply_date_window(seed_url: str) -> str:
+        """Inject datumVon=today and datumBis=today+365d into the ICMS URL.
+
+        Strips any existing datumVon/datumBis params from the seed_url,
+        then appends fresh ones computed at crawl time. All other query
+        params are preserved.
+        """
+        today = date.today()
+        datum_von = today.strftime("%d.%m.%Y")
+        datum_bis = (today + timedelta(days=365)).strftime("%d.%m.%Y")
+
+        parsed = urlparse(seed_url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        # Remove any hardcoded date params
+        params.pop("datumVon", None)
+        params.pop("datumBis", None)
+        # Add fresh date window
+        params["datumVon"] = [datum_von]
+        params["datumBis"] = [datum_bis]
+
+        new_query = urlencode(params, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+
     def fetch(self, cfg: SourceConfig) -> List[ExtractedItem]:
         # Surface tracking: single listing page
         self._surfaces_attempted = 1
 
-        res = http_get(cfg.seed_url, render_js=True)
+        fetch_url = self._apply_date_window(cfg.seed_url)
+        self._fetch_url = fetch_url
+        print(f"MaennedorfPortalAdapter [{cfg.source_id}]: fetch URL: {fetch_url}")
+        res = http_get(fetch_url, render_js=True)
         html = res.text or ""
 
         self._surfaces_succeeded = 1
@@ -483,6 +511,7 @@ class MaennedorfPortalAdapter(BaseAdapter):
                 "adapter": "maennedorf_portal",
                 "detail_parsed": True,
                 "extraction_method": extraction_method,
+                "fetch_url": getattr(self, "_fetch_url", None),
                 **({"image_url": image_url} if image_url else {}),
                 **({"organiser": organiser} if organiser else {}),
                 **({"price_type": price_info["price_type"]} if "price_type" in price_info else {}),
