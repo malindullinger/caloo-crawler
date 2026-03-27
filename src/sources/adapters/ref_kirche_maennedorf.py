@@ -367,6 +367,14 @@ class RefKircheMaennedorfAdapter(BaseAdapter):
         if location:
             location = _unescape_ics(location)
 
+        # Phase 7E: when LOCATION is empty and title contains "Ausflug",
+        # extract the destination from the title as a location fallback.
+        # e.g., "Ferien ohne Koffer - Ausflug Zoo Zurich" → "Zoo Zurich"
+        if not location and title:
+            m_ausflug = re.search(r"\bAusflug\s+(.+)$", title, re.IGNORECASE)
+            if m_ausflug:
+                location = m_ausflug.group(1).strip()
+
         return ExtractedItem(
             title_raw=title,
             datetime_raw=datetime_raw,

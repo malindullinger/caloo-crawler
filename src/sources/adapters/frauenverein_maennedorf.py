@@ -84,6 +84,20 @@ _THEME_PREFIX_RE = re.compile(
     r"^Kulinarischer Kulturtreff\b", re.IGNORECASE,
 )
 
+# Phase 7E: Known venues for this source — used as description-text fallback
+# when no Swiss postal code address is found.  These are the 4 recurring
+# venues that appear in description text as "im Gemeindesaal" or similar.
+_KNOWN_VENUES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bGemeindesaal\s+Zentrum\s+Leue\b", re.IGNORECASE),
+     "Gemeindesaal Zentrum Leue, Männedorf"),
+    (re.compile(r"\bKirchgemeindehaus\b", re.IGNORECASE),
+     "Kirchgemeindehaus, Männedorf"),
+    (re.compile(r"\bUntervogthaus\b", re.IGNORECASE),
+     "Untervogthaus, Männedorf"),
+    (re.compile(r"\bKino\s+Wildenmann\b", re.IGNORECASE),
+     "Kino Wildenmann, Männedorf"),
+]
+
 
 def _find_events(data) -> list[dict]:
     """Find Event objects in JSON-LD, handling top-level, @graph, and array."""
@@ -272,6 +286,16 @@ class FrauenvereinMaennedorfAdapter(BaseAdapter):
                     debug["location_source"] = "description_address"
                     debug["location_raw_matched"] = m.group(0).strip()
                     return location, debug
+
+        # ── Tier 1.5: known venue names in description text ─────────────
+        # Phase 7E: matches common venue names without requiring postal code.
+        if desc_el:
+            text = desc_el.get_text(" ", strip=True)
+            for pattern, venue_name in _KNOWN_VENUES:
+                if pattern.search(text):
+                    debug["location_source"] = "description_known_venue"
+                    debug["location_raw_matched"] = venue_name
+                    return venue_name, debug
 
         # ── Tier 2: venue from title separator ───────────────────────────
         if _TITLE_VENUE_SEP in title:

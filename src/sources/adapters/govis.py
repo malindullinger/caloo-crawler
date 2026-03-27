@@ -161,6 +161,31 @@ class GovisAdapter(BaseAdapter):
             if loc_text:
                 location_raw = loc_text
 
+        # Phase 7E: description-based venue fallback when structured location
+        # is missing.  GOViS CMS omits the location block when the publisher
+        # leaves the venue field empty, but venue is sometimes in prose.
+        if not location_raw:
+            for el in [
+                soup.select_one("p.mod-event__lead"),
+                soup.select_one("div.mod-event__content"),
+            ]:
+                if not el:
+                    continue
+                text = el.get_text(" ", strip=True)
+                # Match "im/ins/in {VenueName}" patterns
+                m = re.search(
+                    r"\b(?:im|ins|in)\s+(Gemeindehaus|Gemeindezentrum|"
+                    r"Kirchgemeindehaus|Pfarreizentrum|Reformiertes Kirchgemeindehaus)"
+                    r"(?:\s*,\s*(\S.{0,40}))?",
+                    text, re.IGNORECASE,
+                )
+                if m:
+                    location_raw = m.group(1).strip()
+                    suffix = (m.group(2) or "").strip().rstrip(".")
+                    if suffix:
+                        location_raw = f"{location_raw}, {suffix}"
+                    break
+
         # Description: lead + content
         description_parts: List[str] = []
         lead_el = soup.select_one("p.mod-event__lead")
