@@ -9,6 +9,37 @@ from .types import SourceConfig, ExtractedItem
 
 
 class BaseAdapter(ABC):
+    """Base class for all source adapters.
+
+    ARCHITECTURAL CONTRACT — DISCOVERY COMPLETENESS
+    ================================================
+    Adapters must prioritize extraction completeness over relevance filtering.
+
+    Relevance classification (family vs excluded vs neutral) is NOT the
+    crawler's responsibility. It belongs to the feed layer, specifically
+    to classify_family_relevance() in the feed RPC.
+
+    Adapters SHOULD:
+    - Extract ALL events from a source, regardless of category or audience
+    - Store source-level category metadata in extra{} for downstream use
+    - Respect max_items quotas (volume cap, not relevance filter)
+
+    Adapters SHOULD NOT:
+    - Skip events because they appear non-family-relevant
+    - Filter by category IDs before detail page extraction
+    - Implement relevance classification logic
+
+    KNOWN EXCEPTIONS (technical debt, tracked for resolution):
+    - maennedorf_portal: filters by _hauptkategorieId (ICMS categories)
+    - ref_kirche_maennedorf: filters by ICS SUMMARY prefix relevance
+    - forum_magazin: only crawls family/youth category URL paths
+
+    These exceptions predate the formal relevance spectrum policy
+    (docs/product/audience-inference-vision.md). They should be
+    resolved by crawling all events and storing category metadata
+    in extra{} for downstream classification.
+    """
+
     def __init__(self) -> None:
         # Surface tracking (set by each adapter's fetch())
         self._surfaces_attempted: int = 0

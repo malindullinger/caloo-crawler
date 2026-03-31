@@ -354,6 +354,41 @@ class MaennedorfPortalAdapter(BaseAdapter):
             result["url"] = website
         return result
 
+    # Labels that indicate an organizer in ICMS <dl> blocks, checked
+    # case-insensitively. Order = priority (first match wins).
+    _ORGANISER_DL_LABELS = (
+        "Veranstalter",
+        "Organisation",
+        "Durchführung",
+        "Anbieter",
+        "Kontakt",
+    )
+
+    @staticmethod
+    def _extract_organiser_from_dl(dl_fields: dict) -> dict | None:
+        """Fallback: extract organizer name from <dl> labeled fields.
+
+        Only used when _extract_address() returned None.
+        Returns {"name": ...} dict matching the standard organiser shape,
+        or None if no suitable label/value found.
+        """
+        for label in MaennedorfPortalAdapter._ORGANISER_DL_LABELS:
+            for key, val in dl_fields.items():
+                if key.lower().startswith(label.lower()):
+                    text = val["text"].strip()
+                    # Reject values that are clearly not organizer entities:
+                    # phone numbers, email addresses, URLs, very short fragments
+                    if not text or len(text) < 4 or len(text) > 200:
+                        continue
+                    if "@" in text:
+                        continue
+                    if text.startswith("http://") or text.startswith("https://"):
+                        continue
+                    if re.match(r"^[\d\s+\-/()\\.]+$", text):
+                        continue
+                    return {"name": text}
+        return None
+
     @staticmethod
     def _parse_price(preis_text: str) -> dict:
         """Parse the Preis field into price_type and price_from_chf.
@@ -465,6 +500,12 @@ class MaennedorfPortalAdapter(BaseAdapter):
         # ----------------------------
         dl_fields = self._extract_dl_fields(soup)
         organiser = self._extract_address(soup)
+
+        # Fallback: organizer from <dl> fields when <address> is absent.
+        # ICMS "Informationen" sections sometimes contain organizer-related
+        # labels (Veranstalter, Organisation, Kontakt, Durchführung, Anbieter).
+        if not organiser:
+            organiser = self._extract_organiser_from_dl(dl_fields)
 
         # Price
         price_info: dict = {}

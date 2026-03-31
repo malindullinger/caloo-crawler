@@ -353,7 +353,9 @@ class ForumMagazinAdapter(BaseAdapter):
         if image_url:
             data["image_url"] = image_url
 
-        # Organizer: only extract when explicitly labeled "Veranstalter:"
+        # Organizer: extract from explicitly labeled "Veranstalter:" field,
+        # with <meta name="author"> fallback for pages without the label.
+        organiser_name = None
         org_el = soup.select_one(".event__location__detail")
         if org_el:
             spans = org_el.find_all("span")
@@ -364,8 +366,32 @@ class ForumMagazinAdapter(BaseAdapter):
                     found_label = True
                     continue
                 if found_label and text:
-                    data["organiser"] = {"name": text}
+                    organiser_name = text
                     break
+
+        # Fallback: <meta name="author"> — Forum Magazin is a parish
+        # publication platform where author typically = parish/organizer.
+        if not organiser_name:
+            meta_author = soup.find("meta", attrs={"name": "author"})
+            if meta_author:
+                author = (meta_author.get("content") or "").strip()
+                # Reject obvious non-organizer values (generic CMS defaults,
+                # phone/email fragments, very short or very long strings)
+                if (
+                    author
+                    and len(author) >= 4
+                    and len(author) <= 120
+                    and "@" not in author
+                    and not re.match(r"^[\d\s+\-/()\\.]+$", author)
+                    and author.lower() not in (
+                        "admin", "administrator", "webmaster",
+                        "forum magazin", "forum-magazin", "redaktion",
+                    )
+                ):
+                    organiser_name = author
+
+        if organiser_name:
+            data["organiser"] = {"name": organiser_name}
 
         # Shared modules: content surfaces, detail fields, link classification
         surfaces = scan_content_surfaces(soup, detail_url)

@@ -40,6 +40,64 @@ _MAX_PAGES = 30
 _PAGE_TOTAL_RE = re.compile(r"Seite\s+\d+\s+von\s+(\d+)")
 
 
+# German labels that indicate an organizer field, checked case-insensitively.
+_ORGANISER_LABELS_RE = re.compile(
+    r"^(Veranstalter(?:in)?|Organisator(?:in)?|Organisation)[:\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_labeled_organizer(soup: BeautifulSoup) -> str | None:
+    """Extract organizer from labeled text in info/booking blocks.
+
+    Scans <dt>/<dd> pairs and <strong>/<span> label patterns in
+    mod-event__bookinginfo and mod-event__content for organizer labels.
+    Returns the value text or None.
+    """
+    # Check <dl> blocks (some GOViS pages use definition lists for metadata)
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        for dt, dd in zip(dts, dds):
+            label = dt.get_text(strip=True)
+            if _ORGANISER_LABELS_RE.match(label):
+                val = dd.get_text(" ", strip=True)
+                if val and len(val) >= 3 and len(val) <= 200:
+                    # Reject phone/email/URL-only values
+                    if "@" in val or val.startswith("http"):
+                        continue
+                    if re.match(r"^[\d\s+\-/()\\.]+$", val):
+                        continue
+                    return val
+
+    # Check labeled text in booking/info sections (strong/span pattern)
+    for container_sel in (
+        "div.mod-event__bookinginfo",
+        "div.mod-event__content",
+    ):
+        container = soup.select_one(container_sel)
+        if not container:
+            continue
+        for strong in container.find_all(["strong", "b"]):
+            label = strong.get_text(strip=True)
+            if _ORGANISER_LABELS_RE.match(label):
+                # Value is the next sibling text or next element
+                next_sib = strong.next_sibling
+                if next_sib:
+                    val = (
+                        next_sib.get_text(strip=True)
+                        if hasattr(next_sib, "get_text")
+                        else str(next_sib).strip()
+                    )
+                    # Strip leading colon/whitespace
+                    val = re.sub(r"^[:\s]+", "", val).strip()
+                    if val and len(val) >= 3 and len(val) <= 200:
+                        if "@" not in val and not val.startswith("http"):
+                            if not re.match(r"^[\d\s+\-/()\\.]+$", val):
+                                return val
+    return None
+
+
 class GovisAdapter(BaseAdapter):
     """
     TIER A SOURCE — GENERIC GOViS CMS
@@ -200,11 +258,34 @@ class GovisAdapter(BaseAdapter):
                 description_parts.append(text)
         description_raw = "\n\n".join(description_parts)[:4000] if description_parts else None
 
-        # Organizer
+        # Organizer — deterministic extraction with cascading fallbacks:
+        # 1. Primary: .event-organisator-custom (most specific)
+        # 2. Broader: any text in div.mod-event__organisators
+        # 3. Labeled: "Veranstalter"/"Organisator" in info/booking blocks
         organizer_raw = None
         org_el = soup.select_one("div.mod-event__organisators .event-organisator-custom")
         if org_el:
             organizer_raw = org_el.get_text(strip=True)
+
+        # Fallback 1: broader organisators block (different GOViS versions
+        # may use different child elements within the same container)
+        if not organizer_raw:
+            org_container = soup.select_one("div.mod-event__organisators")
+            if org_container:
+                text = org_container.get_text(" ", strip=True)
+                # Strip common heading text that isn't the organizer name
+                text = re.sub(
+                    r"^(Veranstalter|Organisator|Veranstalterin)[:\s]*",
+                    "", text, flags=re.IGNORECASE,
+                ).strip()
+                if text and len(text) >= 3 and len(text) <= 200:
+                    organizer_raw = text
+
+        # Fallback 2: labeled organizer in info/booking blocks.
+        # Some GOViS pages embed organizer as labeled text rather than in
+        # the dedicated organisators section.
+        if not organizer_raw:
+            organizer_raw = _extract_labeled_organizer(soup)
 
         # Price/cost
         price_raw = None
